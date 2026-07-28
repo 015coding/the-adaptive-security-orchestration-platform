@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import PolicyEngine, ScopePolicyInput
+from app.vm_runner import SshVmRunner, VmCommandResult, VmRunnerError
 
 APPROVED_WORKFLOW_NODE_TYPES = {
     "recon-agent",
@@ -131,6 +132,34 @@ class PolicyDecisionResponse(BaseModel):
     reason: str
 
 
+class CreateVmTaskRequest(BaseModel):
+    scopeId: str
+    environment: str = Field(pattern="^(kali|debian)$")
+    target: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    artifactReferences: list[str] = Field(default_factory=list)
+
+    @field_validator("artifactReferences")
+    @classmethod
+    def artifact_references_must_stay_in_the_run_workspace(cls, references: list[str]) -> list[str]:
+        if any(not reference or reference.startswith("/") or ".." in Path(reference).parts for reference in references):
+            raise ValueError("artifact references must be relative to the Run Workspace")
+        return references
+
+
+class RunLogBundleResponse(BaseModel):
+    id: str
+    scopeId: str
+    environment: str
+    workspace: str
+    status: str
+    exitCode: int | None
+    stdout: str
+    stderr: str
+    artifactReferences: list[str]
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -190,6 +219,18 @@ def _initialize_database(database_path: Path) -> None:
                 reason TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS run_log_bundles (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES scopes(id),
+                environment TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                task_status TEXT NOT NULL,
+                exit_code INTEGER,
+                stdout TEXT NOT NULL,
+                stderr TEXT NOT NULL,
+                artifact_references_json TEXT NOT NULL
+            );
+
             INSERT OR IGNORE INTO crystal_flow_versions (
                 crystal_flow_id, version, nodes_json, edges_json
             )
@@ -198,7 +239,7 @@ def _initialize_database(database_path: Path) -> None:
         )
 
 
-def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
+def create_app(database_path: Path | str = Path("data/platform.db"), vm_runner: object | None = None) -> FastAPI:
     resolved_database_path = Path(database_path)
 
     @asynccontextmanager
@@ -208,6 +249,7 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
 
     app = FastAPI(title="Adaptive Security Orchestration Platform", lifespan=lifespan)
     policy_engine = PolicyEngine()
+    configured_vm_runner = vm_runner or SshVmRunner.from_environment()
 
     def current_crystal_flow(connection: sqlite3.Connection, crystal_flow_id: str) -> CrystalFlowResponse | None:
         flow = connection.execute(
@@ -229,6 +271,16 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
             version=flow["version"],
             nodes=json.loads(flow["nodes_json"]),
             edges=json.loads(flow["edges_json"]),
+        )
+
+    def scope_policy_input(scope: sqlite3.Row) -> ScopePolicyInput:
+        return ScopePolicyInput(
+            targets=tuple(json.loads(scope["targets_json"])),
+            allowed_actions=tuple(json.loads(scope["allowed_actions_json"])),
+            starts_at=datetime.fromisoformat(scope["starts_at"]),
+            expires_at=datetime.fromisoformat(scope["expires_at"]),
+            unattended_execution=bool(scope["unattended_execution"]),
+            authorized_lab_environment=bool(scope["authorized_lab_environment"]),
         )
 
     def crystal_flow_version(
@@ -372,14 +424,7 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
             if scope is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
             outcome = policy_engine.evaluate(
-                ScopePolicyInput(
-                    targets=tuple(json.loads(scope["targets_json"])),
-                    allowed_actions=tuple(json.loads(scope["allowed_actions_json"])),
-                    starts_at=datetime.fromisoformat(scope["starts_at"]),
-                    expires_at=datetime.fromisoformat(scope["expires_at"]),
-                    unattended_execution=bool(scope["unattended_execution"]),
-                    authorized_lab_environment=bool(scope["authorized_lab_environment"]),
-                ),
+                scope_policy_input(scope),
                 target=request.target,
                 action=request.action,
             )
@@ -424,6 +469,95 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
                 reason=decision["reason"],
             )
             for decision in decisions
+        ]
+
+    @app.post("/api/vm-tasks", response_model=RunLogBundleResponse, status_code=status.HTTP_201_CREATED)
+    def run_vm_task(request: CreateVmTaskRequest) -> RunLogBundleResponse:
+        with _connect(resolved_database_path) as connection:
+            scope = connection.execute("SELECT * FROM scopes WHERE id = ?", (request.scopeId,)).fetchone()
+            if scope is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+            outcome = policy_engine.evaluate(
+                scope_policy_input(scope), target=request.target, action=request.action
+            )
+            workspace = scope["workspace"]
+            if outcome.status != "allow":
+                command_result = VmCommandResult(exit_code=0, stdout="", stderr=outcome.reason)
+                task_status = "blocked"
+                exit_code: int | None = None
+            else:
+                try:
+                    limits = json.loads(scope["resource_limits_json"])
+                    command_result = configured_vm_runner.execute(
+                        environment=request.environment,
+                        workspace=workspace,
+                        command=request.command,
+                        timeout_seconds=limits["maxRuntimeSeconds"],
+                    )
+                    task_status = "completed" if command_result.exit_code == 0 else "failed"
+                    exit_code = command_result.exit_code
+                except VmRunnerError as error:
+                    command_result = VmCommandResult(exit_code=1, stdout="", stderr=str(error))
+                    task_status = "failed"
+                    exit_code = 1
+            log_bundle_id = uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO run_log_bundles (
+                    id, scope_id, environment, workspace, task_status, exit_code, stdout, stderr,
+                    artifact_references_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    log_bundle_id,
+                    request.scopeId,
+                    request.environment,
+                    workspace,
+                    task_status,
+                    exit_code,
+                    command_result.stdout,
+                    command_result.stderr,
+                    json.dumps(request.artifactReferences),
+                ),
+            )
+        return RunLogBundleResponse(
+            id=log_bundle_id,
+            scopeId=request.scopeId,
+            environment=request.environment,
+            workspace=workspace,
+            status=task_status,
+            exitCode=exit_code,
+            stdout=command_result.stdout,
+            stderr=command_result.stderr,
+            artifactReferences=request.artifactReferences,
+        )
+
+    @app.get("/api/scopes/{scope_id}/run-log-bundles", response_model=list[RunLogBundleResponse])
+    def list_run_log_bundles(scope_id: str) -> list[RunLogBundleResponse]:
+        with _connect(resolved_database_path) as connection:
+            bundles = connection.execute(
+                """
+                SELECT id, scope_id, environment, workspace, task_status, exit_code, stdout, stderr,
+                       artifact_references_json
+                FROM run_log_bundles
+                WHERE scope_id = ?
+                ORDER BY rowid
+                """,
+                (scope_id,),
+            ).fetchall()
+        return [
+            RunLogBundleResponse(
+                id=bundle["id"],
+                scopeId=bundle["scope_id"],
+                environment=bundle["environment"],
+                workspace=bundle["workspace"],
+                status=bundle["task_status"],
+                exitCode=bundle["exit_code"],
+                stdout=bundle["stdout"],
+                stderr=bundle["stderr"],
+                artifactReferences=json.loads(bundle["artifact_references_json"]),
+            )
+            for bundle in bundles
         ]
 
     @app.post(

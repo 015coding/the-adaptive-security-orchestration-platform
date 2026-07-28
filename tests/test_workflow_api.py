@@ -3,6 +3,25 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.vm_runner import VmCommandResult
+
+
+class ControlledVmRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def execute(
+        self, *, environment: str, workspace: str, command: list[str], timeout_seconds: int
+    ) -> VmCommandResult:
+        self.calls.append(
+            {
+                "environment": environment,
+                "workspace": workspace,
+                "command": command,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return VmCommandResult(exit_code=0, stdout="target discovered", stderr="")
 
 
 def test_owner_can_create_reopen_and_run_a_blank_crystal_flow(tmp_path):
@@ -138,6 +157,108 @@ def test_owner_cannot_save_an_unapproved_workflow_node_type(tmp_path):
         )
 
     assert saved.status_code == 422
+
+
+def test_permitted_vm_task_runs_in_the_scope_workspace_and_returns_a_host_log_bundle(tmp_path):
+    runner = ControlledVmRunner()
+    app = create_app(database_path=tmp_path / "platform.db", vm_runner=runner)
+    now = datetime.now(UTC)
+
+    with TestClient(app) as client:
+        scope = client.post(
+            "/api/scopes",
+            json={
+                "targets": ["https://lab.example.test"],
+                "workspace": "/srv/adaptive-security/runs/run-1",
+                "allowedActions": ["reconnaissance"],
+                "resourceLimits": {
+                    "maxRequestsPerSecond": 5,
+                    "maxConcurrentTasks": 1,
+                    "maxRuntimeSeconds": 600,
+                },
+                "startsAt": now.isoformat(),
+                "expiresAt": (now + timedelta(hours=1)).isoformat(),
+                "unattendedExecution": False,
+                "authorizedLabEnvironment": True,
+            },
+        ).json()
+        task = client.post(
+            "/api/vm-tasks",
+            json={
+                "scopeId": scope["id"],
+                "environment": "kali",
+                "target": "https://lab.example.test",
+                "action": "reconnaissance",
+                "command": ["nmap", "--version"],
+                "artifactReferences": ["output/recon.json"],
+            },
+        )
+
+        assert task.status_code == 201
+        assert task.json() == {
+            "id": task.json()["id"],
+            "scopeId": scope["id"],
+            "environment": "kali",
+            "workspace": "/srv/adaptive-security/runs/run-1",
+            "status": "completed",
+            "exitCode": 0,
+            "stdout": "target discovered",
+            "stderr": "",
+            "artifactReferences": ["output/recon.json"],
+        }
+        assert runner.calls == [
+            {
+                "environment": "kali",
+                "workspace": "/srv/adaptive-security/runs/run-1",
+                "command": ["nmap", "--version"],
+                "timeout_seconds": 600,
+            }
+        ]
+
+        logs = client.get(f"/api/scopes/{scope['id']}/run-log-bundles")
+        assert logs.status_code == 200
+        assert logs.json() == [task.json()]
+
+
+def test_out_of_scope_vm_task_is_blocked_without_calling_the_vm_runner(tmp_path):
+    runner = ControlledVmRunner()
+    app = create_app(database_path=tmp_path / "platform.db", vm_runner=runner)
+    now = datetime.now(UTC)
+
+    with TestClient(app) as client:
+        scope = client.post(
+            "/api/scopes",
+            json={
+                "targets": ["https://lab.example.test"],
+                "workspace": "/srv/adaptive-security/runs/run-1",
+                "allowedActions": ["reconnaissance"],
+                "resourceLimits": {
+                    "maxRequestsPerSecond": 5,
+                    "maxConcurrentTasks": 1,
+                    "maxRuntimeSeconds": 600,
+                },
+                "startsAt": now.isoformat(),
+                "expiresAt": (now + timedelta(hours=1)).isoformat(),
+                "unattendedExecution": False,
+                "authorizedLabEnvironment": True,
+            },
+        ).json()
+        task = client.post(
+            "/api/vm-tasks",
+            json={
+                "scopeId": scope["id"],
+                "environment": "kali",
+                "target": "https://outside.example.test",
+                "action": "reconnaissance",
+                "command": ["nmap", "--version"],
+                "artifactReferences": [],
+            },
+        )
+
+    assert task.status_code == 201
+    assert task.json()["status"] == "blocked"
+    assert task.json()["stderr"] == "target is outside Scope"
+    assert runner.calls == []
 
 
 def test_owner_cannot_create_a_crystal_flow_with_a_whitespace_only_name(tmp_path):
