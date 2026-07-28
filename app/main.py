@@ -495,7 +495,8 @@ def _initialize_database(database_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS workflow_runs (
                 id TEXT PRIMARY KEY,
                 crystal_flow_id TEXT NOT NULL REFERENCES crystal_flows(id),
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                stop_requested INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS crystal_flow_versions (
@@ -705,6 +706,9 @@ def _initialize_database(database_path: Path) -> None:
             SELECT id, 1, '[]', '[]' FROM crystal_flows;
             """
         )
+        run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(workflow_runs)").fetchall()}
+        if "stop_requested" not in run_columns:
+            connection.execute("ALTER TABLE workflow_runs ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0")
         invocation_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(ai_node_invocations)").fetchall()
@@ -1028,6 +1032,13 @@ def create_app(
         with _connect(resolved_database_path) as connection:
             connection.execute("UPDATE workflow_runs SET status = ? WHERE id = ?", (run_status, run_id))
 
+    def run_stop_requested(run_id: str) -> bool:
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute(
+                "SELECT stop_requested FROM workflow_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return bool(run and run["stop_requested"])
+
     def record_run_event(run_id: str, event_type: str, crystal_flow_id: str) -> None:
         with _connect(resolved_database_path) as connection:
             connection.execute(
@@ -1092,6 +1103,8 @@ def create_app(
             record_run_event(run_id, "run.started", flow.id)
 
             for _ in range(100):
+                if run_stop_requested(run_id):
+                    return
                 if current_node_id is None:
                     set_run_status(run_id, "completed")
                     record_run_event(run_id, "run.completed", flow.id)
@@ -1203,6 +1216,10 @@ def create_app(
                                 node_status = "failed"
                                 output = {"reason": str(error)}
 
+                if run_stop_requested(run_id):
+                    set_node_status(run_id, node_id, "stopped")
+                    record_agent_message(run_id, node_id, None, "execution-stopped", output)
+                    return
                 set_node_status(run_id, node_id, node_status)
                 record_run_event(run_id, f"node.{node_status}", flow.id)
                 previous_output = output
@@ -2437,8 +2454,8 @@ def create_app(
             if flow_exists is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
             connection.execute(
-                "INSERT INTO workflow_runs (id, crystal_flow_id, status) VALUES (?, ?, ?)",
-                (run_id, crystal_flow_id, "created"),
+                "INSERT INTO workflow_runs (id, crystal_flow_id, status, stop_requested) VALUES (?, ?, ?, ?)",
+                (run_id, crystal_flow_id, "created", 0),
             )
             connection.execute(
                 """
@@ -2449,6 +2466,31 @@ def create_app(
             )
         background_tasks.add_task(orchestrate_run, run_id)
         return RunResponse(id=run_id, crystalFlowId=crystal_flow_id, status="created")
+
+    @app.post("/api/runs/{run_id}/stop", response_model=RunResponse)
+    def stop_run(run_id: str) -> RunResponse:
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute(
+                "SELECT id, crystal_flow_id, status FROM workflow_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+            terminal_statuses = {"completed", "failed", "blocked", "stopped", "waiting-for-approval", "timeout", "resource-exceeded"}
+            if run["status"] in terminal_statuses:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Run is already {run['status']}")
+            connection.execute(
+                "UPDATE workflow_runs SET status = ?, stop_requested = 1 WHERE id = ?",
+                ("stopped", run_id),
+            )
+            connection.execute(
+                "INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id) VALUES (?, ?, ?)",
+                ("run.stop-requested", run_id, run["crystal_flow_id"]),
+            )
+            connection.execute(
+                "INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id) VALUES (?, ?, ?)",
+                ("run.stopped", run_id, run["crystal_flow_id"]),
+            )
+        return RunResponse(id=run_id, crystalFlowId=run["crystal_flow_id"], status="stopped")
 
     @app.get("/api/runs/{run_id}", response_model=RunResponse)
     def get_run(run_id: str) -> RunResponse:

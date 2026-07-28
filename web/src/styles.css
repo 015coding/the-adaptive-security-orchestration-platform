@@ -302,6 +302,7 @@ select:hover, select:focus { border-color: var(--cyan); }
 .button.primary { border-color: #38c9bf; color: #06191a; background: var(--cyan); }
 .button.secondary { background: #10202d; }
 .button.danger { border-color: rgba(239, 107, 114, 0.35); color: #ef969b; background: rgba(239, 107, 114, 0.08); }
+.dock-actions { display: flex; align-items: center; gap: 8px; }
 
 .theme-toggle {
   display: inline-flex;
@@ -671,7 +672,8 @@ select:hover, select:focus { border-color: var(--cyan); }
 .security-node > strong, .security-node > small { display: block; }
 .security-node > strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .security-node > small { margin-top: 4px; color: #5e778a; font-size: 8px; text-transform: capitalize; }
-.security-node .react-flow__handle { width: 7px; height: 7px; border: 1px solid #4b7585; background: #0a1721; }
+.security-node .react-flow__handle { width: 14px; height: 14px; border: 2px solid #4b7585; background: #0a1721; cursor: crosshair; }
+.security-node .react-flow__handle:hover { border-color: var(--cyan); background: var(--cyan); box-shadow: 0 0 0 4px rgba(52, 211, 199, 0.16); }
 .security-node .react-flow__handle-left { left: -4px; }
 .security-node .react-flow__handle-right { right: -4px; }
 

@@ -837,6 +837,18 @@ export function App() {
     }
   }
 
+  async function stopRun() {
+    if (!run) return;
+    setError(null);
+    try {
+      const stopping = await request<WorkflowRun>(`/api/runs/${run.id}/stop`, { method: "POST" });
+      setRun(stopping);
+      await refreshRunDetails(stopping.id);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to stop run");
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -907,6 +919,7 @@ export function App() {
             </button>
             {page === "workflows" && flow && <button className="button danger" onClick={() => void deleteFlow()} type="button">Delete flow</button>}
             {page === "workflows" && flow && <button className="button secondary" onClick={saveFlow} type="button">Save version</button>}
+            {page === "workflows" && run && !["completed", "failed", "blocked", "stopped", "waiting-for-approval", "timeout", "resource-exceeded"].includes(run.status) && <button className="button danger" onClick={() => void stopRun()} type="button">■ Stop run</button>}
             {page === "workflows" && flow && <button className="button primary" onClick={startRun} type="button"><span>▶</span>{run ? "Start new run" : "Start run"}</button>}
           </div>
         </header>
@@ -985,10 +998,11 @@ export function App() {
               <section className="canvas-panel">
                 <div className="canvas-toolbar">
                   <div><span className="canvas-state-dot" />Graph ready</div>
-                  <div><span>Drag to pan</span><span>Scroll to zoom</span></div>
+                  <div><span>Drag from the right handle to the left handle to connect nodes</span><span>Scroll to zoom</span></div>
                 </div>
                 <div className="canvas" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
                   <ReactFlow
+                    connectionRadius={30}
                     edges={visualEdges}
                     fitView
                     nodeTypes={nodeTypes}
@@ -1067,7 +1081,7 @@ export function App() {
 
             {run && (
               <section className="operations-dock" aria-labelledby="execution-title">
-                <div className="dock-header"><div><span className={`pulse-dot ${run.status !== "running" ? "pulse-static" : ""}`} /><span><strong id="execution-title">Live execution · {run.status}</strong><small>{run.id.slice(0, 12)} · polling every 2 seconds</small></span></div><button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh now</button></div>
+                <div className="dock-header"><div><span className={`pulse-dot ${run.status !== "running" ? "pulse-static" : ""}`} /><span><strong id="execution-title">Live execution · {run.status}</strong><small>{run.id.slice(0, 12)} · polling every 2 seconds</small></span></div><div className="dock-actions"><button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh now</button>{!["completed", "failed", "blocked", "stopped", "waiting-for-approval", "timeout", "resource-exceeded"].includes(run.status) && <button className="button danger" onClick={() => void stopRun()} type="button">Stop run</button>}</div></div>
                 <div className="dock-grid">
                   <section><div className="dock-section-title"><span>NODE STATUS</span><b>{nodeStatuses.length}</b></div>{nodeStatuses.length === 0 ? <p className="empty-copy">Waiting for Workflow Node activity.</p> : <ul className="status-list">{nodeStatuses.map((item) => <li key={item.nodeId}><span>{item.nodeId}</span><span className={`status-pill status-${item.status}`}>{item.status}</span></li>)}</ul>}</section>
                   <section><div className="dock-section-title"><span>EXECUTION TRAIL</span><b>{audit.length}</b></div><ul className="audit-list">{audit.map((event, index) => <li key={`${event.eventType}-${index}`}><i />{event.eventType}</li>)}</ul></section>

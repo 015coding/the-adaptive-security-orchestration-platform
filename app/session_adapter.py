@@ -35,7 +35,9 @@ class SubprocessCodexCli:
 
     def execute(self, request: dict[str, object], timeout_seconds: int) -> CodexCliResult:
         if not self._command:
-            raise CodexCliError("Codex CLI session is not configured")
+            raise CodexCliError(
+                "Codex CLI session is not configured; set CODEX_SESSION_COMMAND to the local JSON bridge command"
+            )
         try:
             result = subprocess.run(
                 shlex.split(self._command),

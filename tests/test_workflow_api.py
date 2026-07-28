@@ -103,6 +103,27 @@ def test_owner_can_create_reopen_and_run_a_blank_crystal_flow(tmp_path):
         ]
 
 
+def test_owner_can_stop_a_run_and_audit_the_stop_request(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Stoppable flow"}).json()
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        stopped = client.post(f"/api/runs/{run['id']}/stop")
+        current = client.get(f"/api/runs/{run['id']}")
+        audit = client.get(f"/api/runs/{run['id']}/audit")
+
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "stopped"
+    assert current.status_code == 200
+    assert current.json()["status"] == "stopped"
+    assert [event["eventType"] for event in audit.json()] == [
+        "run.created",
+        "run.stop-requested",
+        "run.stopped",
+    ]
+
+
 def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 
