@@ -16,7 +16,6 @@ import {
   ReactFlow,
   ReactFlowInstance,
 } from "@xyflow/react";
-import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import "@xyflow/react/dist/style.css";
 
 type NodeKind = "recon-agent" | "verification-step" | "approval-gate" | "custom-agent";
@@ -201,17 +200,16 @@ function keepValidBranches(workflowNodes: WorkflowNode[], workflowEdges: Edge[])
 }
 
 export function App() {
-  const location = useLocation();
-  const navigate = useNavigate();
-  const page = location.pathname.startsWith("/runs")
+  const [pathname, setPathname] = useState(window.location.pathname);
+  const page = pathname.startsWith("/runs")
     ? "runs"
-    : location.pathname.startsWith("/findings")
+    : pathname.startsWith("/findings")
       ? "findings"
-      : location.pathname.startsWith("/policy")
+      : pathname.startsWith("/policy")
         ? "policy"
         : "workflows";
   const routeFlowId = page === "workflows"
-    ? location.pathname.match(/^\/workflows\/([^/]+)$/)?.[1] ?? null
+    ? pathname.match(/^\/workflows\/([^/]+)$/)?.[1] ?? null
     : null;
   const pageTitle = {
     workflows: "Workflow Studio",
@@ -244,6 +242,21 @@ export function App() {
       .then(setSavedFlows)
       .catch(() => setError("Unable to load saved Crystal Flows"));
   }, []);
+
+  useEffect(() => {
+    const onPopState = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  function navigate(path: string, options?: { replace?: boolean }) {
+    if (options?.replace) {
+      window.history.replaceState(null, "", path);
+    } else {
+      window.history.pushState(null, "", path);
+    }
+    setPathname(path);
+  }
 
   useEffect(() => {
     if (!routeFlowId || flow?.id === routeFlowId) return;
@@ -526,10 +539,10 @@ export function App() {
         </div>
 
         <nav className="primary-nav" aria-label="Primary navigation">
-          <NavLink className={({ isActive }) => `nav-item ${isActive || (page === "workflows" && location.pathname === "/") ? "is-active" : ""}`} to="/workflows"><span className="nav-icon">⌘</span>Workflow Studio</NavLink>
-          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/runs"><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></NavLink>
-          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/findings"><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></NavLink>
-          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/policy"><span className="nav-icon">✓</span>Policy &amp; Scope</NavLink>
+          <a className={`nav-item ${page === "workflows" ? "is-active" : ""}`} href="/workflows" onClick={(event) => { event.preventDefault(); navigate("/workflows"); }}><span className="nav-icon">⌘</span>Workflow Studio</a>
+          <a className={`nav-item ${page === "runs" ? "is-active" : ""}`} href="/runs" onClick={(event) => { event.preventDefault(); navigate("/runs"); }}><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></a>
+          <a className={`nav-item ${page === "findings" ? "is-active" : ""}`} href="/findings" onClick={(event) => { event.preventDefault(); navigate("/findings"); }}><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></a>
+          <a className={`nav-item ${page === "policy" ? "is-active" : ""}`} href="/policy" onClick={(event) => { event.preventDefault(); navigate("/policy"); }}><span className="nav-icon">✓</span>Policy &amp; Scope</a>
         </nav>
 
         <div className="sidebar-section">
@@ -547,15 +560,15 @@ export function App() {
           </form>
           <div className="flow-list">
             {savedFlows.map((savedFlow) => (
-              <Link
+              <a
                 className={`flow-list-item ${flow?.id === savedFlow.id ? "is-current" : ""}`}
+                href={`/workflows/${savedFlow.id}`}
                 key={savedFlow.id}
-                onClick={() => openFlow(savedFlow, false)}
-                to={`/workflows/${savedFlow.id}`}
+                onClick={(event) => { event.preventDefault(); openFlow(savedFlow); }}
               >
                 <span className="flow-indicator" />
                 <span><strong>{savedFlow.name}</strong><small>Version {savedFlow.version}</small></span>
-              </Link>
+              </a>
             ))}
           </div>
         </div>
