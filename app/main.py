@@ -185,6 +185,15 @@ class ActionResumeResponse(BaseModel):
     reason: str
 
 
+class ConfigureCodexSessionRequest(BaseModel):
+    command: str = Field(max_length=1024)
+
+
+class CodexSessionResponse(BaseModel):
+    configured: bool
+    command: str
+
+
 class PluginManifestRequest(BaseModel):
     capabilities: list[str] = Field(min_length=1)
     permissions: list[str] = Field(min_length=1)
@@ -617,6 +626,11 @@ def _initialize_database(database_path: Path) -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS evidence_records (
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES workflow_runs(id),
@@ -732,6 +746,13 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _initialize_database(resolved_database_path)
+        with _connect(resolved_database_path) as connection:
+            session_setting = connection.execute(
+                "SELECT setting_value FROM runtime_settings WHERE setting_key = ?",
+                ("codex_session_command",),
+            ).fetchone()
+        if session_setting is not None and session_setting["setting_value"].strip():
+            session_adapter.configure_command(session_setting["setting_value"])
         configure_environment = getattr(configured_vm_runner, "configure", None)
         if callable(configure_environment):
             with _connect(resolved_database_path) as connection:
@@ -1540,6 +1561,47 @@ def create_app(
             workspace=request.workspace,
             status="ready",
         )
+
+    @app.get("/api/codex-session", response_model=CodexSessionResponse)
+    def get_codex_session() -> CodexSessionResponse:
+        with _connect(resolved_database_path) as connection:
+            setting = connection.execute(
+                "SELECT setting_value FROM runtime_settings WHERE setting_key = ?",
+                ("codex_session_command",),
+            ).fetchone()
+        command = setting["setting_value"] if setting else ""
+        return CodexSessionResponse(configured=bool(command.strip()), command=command)
+
+    @app.put("/api/codex-session", response_model=CodexSessionResponse)
+    def configure_codex_session(request: ConfigureCodexSessionRequest) -> CodexSessionResponse:
+        command = request.command.strip()
+        if not command:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Codex Session command is required",
+            )
+        try:
+            session_adapter.configure_command(command)
+        except CodexCliError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                "INSERT INTO runtime_settings (setting_key, setting_value) VALUES (?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value",
+                ("codex_session_command", command),
+            )
+            connection.execute(
+                "INSERT INTO configuration_audit_events (id, event_type, subject, detail_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    uuid4().hex,
+                    "codex-session.configured",
+                    "codex-session",
+                    json.dumps({"configured": True}),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        return CodexSessionResponse(configured=True, command=command)
 
     @app.get(
         "/api/configuration-audit",

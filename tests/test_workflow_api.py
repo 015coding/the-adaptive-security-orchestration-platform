@@ -124,6 +124,25 @@ def test_owner_can_stop_a_run_and_audit_the_stop_request(tmp_path):
     ]
 
 
+def test_owner_can_configure_the_codex_session_from_the_api(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        before = client.get("/api/codex-session")
+        configured = client.put(
+            "/api/codex-session",
+            json={"command": "/usr/local/bin/codex-json-bridge"},
+        )
+        after = client.get("/api/codex-session")
+        audit = client.get("/api/configuration-audit")
+
+    assert before.json() == {"configured": False, "command": ""}
+    assert configured.status_code == 200
+    assert configured.json() == {"configured": True, "command": "/usr/local/bin/codex-json-bridge"}
+    assert after.json() == configured.json()
+    assert audit.json()[0]["eventType"] == "codex-session.configured"
+
+
 def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 

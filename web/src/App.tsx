@@ -49,6 +49,8 @@ type WorkflowRun = {
   status: string;
 };
 
+type CodexSession = { configured: boolean; command: string };
+
 type AuditEvent = {
   eventType: string;
   runId: string;
@@ -513,11 +515,18 @@ export function App() {
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [codexSession, setCodexSession] = useState<CodexSession>({ configured: false, command: "" });
 
   useEffect(() => {
     request<CrystalFlow[]>("/api/crystal-flows")
       .then(setSavedFlows)
       .catch(() => setError("Unable to load saved Crystal Flows"));
+  }, []);
+
+  useEffect(() => {
+    request<CodexSession>("/api/codex-session")
+      .then(setCodexSession)
+      .catch(() => setError("Unable to load Codex Session configuration"));
   }, []);
 
   useEffect(() => {
@@ -849,6 +858,20 @@ export function App() {
     }
   }
 
+  async function saveCodexSession() {
+    setError(null);
+    try {
+      const configured = await request<CodexSession>("/api/codex-session", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: codexSession.command }),
+      });
+      setCodexSession(configured);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to configure Codex Session");
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -951,6 +974,7 @@ export function App() {
           <main className="section-page">
             <div className="page-intro"><span>GOVERNANCE CONTROL PLANE</span><h2>Policy &amp; Scope</h2><p>Execution remains bounded by declared targets, workspaces, permissions, resource limits, and approved VM environments.</p></div>
             <div className="policy-grid">
+              <section className="page-card codex-session-card"><div className="page-card-heading"><span>CODEX SESSION</span><b>{codexSession.configured ? "CONFIGURED" : "NOT CONFIGURED"}</b></div><h3>Local Codex bridge command</h3><input className="wide-input" aria-label="Codex Session bridge command" onChange={(event) => setCodexSession((current) => ({ ...current, command: event.target.value }))} placeholder="/absolute/path/to/codex-json-bridge" value={codexSession.command} /><p>The command must accept one JSON request on stdin and return <code>{'{ output, resourceUnits }'}</code>. It is stored locally and every change is audited.</p><button className="button primary" onClick={() => void saveCodexSession()} type="button">Save Codex Session</button></section>
               <section className="page-card"><div className="page-card-heading"><span>SSH EXECUTION</span><b>HOST MANAGED</b></div><h3>Kali VM alias</h3><code>export KALI_SSH_TARGET=codex-kali</code><p>The platform resolves Kali tasks through this host-approved SSH alias. A node’s SSH field records the intended destination but cannot authorize a new host.</p></section>
               <section className="page-card"><div className="page-card-heading"><span>ENFORCEMENT</span><b>ALWAYS ON</b></div><ul className="control-list"><li>Scope and target validation</li><li>Workspace isolation</li><li>Policy and approval checks</li><li>Rate limits and budgets</li><li>Complete audit recording</li></ul></section>
             </div>

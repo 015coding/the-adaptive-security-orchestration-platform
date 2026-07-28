@@ -33,6 +33,9 @@ class SubprocessCodexCli:
     def __init__(self, command: str | None = None) -> None:
         self._command = command or os.environ.get("CODEX_SESSION_COMMAND", "")
 
+    def configure_command(self, command: str) -> None:
+        self._command = command.strip()
+
     def execute(self, request: dict[str, object], timeout_seconds: int) -> CodexCliResult:
         if not self._command:
             raise CodexCliError(
@@ -64,6 +67,13 @@ class SessionAdapter:
     def __init__(self, codex_cli: CodexCli) -> None:
         self._codex_cli = codex_cli
         self._lock = Lock()
+
+    def configure_command(self, command: str) -> None:
+        configure = getattr(self._codex_cli, "configure_command", None)
+        if not callable(configure):
+            raise CodexCliError("The configured Codex runtime does not support command configuration")
+        with self._lock:
+            configure(command)
 
     def execute(self, request: dict[str, object], timeout_seconds: int) -> CodexCliResult:
         with self._lock:

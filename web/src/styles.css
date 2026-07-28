@@ -303,6 +303,8 @@ select:hover, select:focus { border-color: var(--cyan); }
 .button.secondary { background: #10202d; }
 .button.danger { border-color: rgba(239, 107, 114, 0.35); color: #ef969b; background: rgba(239, 107, 114, 0.08); }
 .dock-actions { display: flex; align-items: center; gap: 8px; }
+.wide-input { width: 100%; margin: 8px 0 10px; }
+.codex-session-card code { color: var(--cyan); }
 
 .theme-toggle {
   display: inline-flex;
