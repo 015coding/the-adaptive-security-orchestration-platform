@@ -185,6 +185,18 @@ class AiNodeInvocationResponse(BaseModel):
     resourceUnits: int
 
 
+class CreateNodeResultRequest(BaseModel):
+    nodeId: str = Field(min_length=1)
+    trigger: str = Field(min_length=1)
+    result: dict[str, object]
+
+
+class NodeResultResponse(BaseModel):
+    nodeStatus: str
+    nextNodeId: str | None
+    message: dict[str, object]
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -264,6 +276,15 @@ def _initialize_database(database_path: Path) -> None:
                 output_json TEXT NOT NULL,
                 timeout_seconds INTEGER NOT NULL,
                 resource_units INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT,
+                trigger TEXT NOT NULL,
+                message_json TEXT NOT NULL
             );
 
             INSERT OR IGNORE INTO crystal_flow_versions (
@@ -691,6 +712,33 @@ def create_app(
             )
             for invocation in invocations
         ]
+
+    @app.post("/api/runs/{run_id}/node-results", response_model=NodeResultResponse, status_code=status.HTTP_201_CREATED)
+    def route_node_result(run_id: str, request: CreateNodeResultRequest) -> NodeResultResponse:
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute("SELECT crystal_flow_id FROM workflow_runs WHERE id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+            flow = current_crystal_flow(connection, run["crystal_flow_id"])
+            assert flow is not None
+            nodes = {node["id"]: node for node in flow.nodes}
+            source = nodes.get(request.nodeId)
+            if source is None:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Workflow Node is not in this Crystal Flow")
+            branches = source.get("config", {}).get("branches", {})
+            next_node_id = branches.get(request.trigger) if isinstance(branches, dict) else None
+            valid_edges = {(edge["source"], edge["target"]) for edge in flow.edges}
+            if next_node_id is not None and (request.nodeId, next_node_id) not in valid_edges:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Branch is not declared by a Workflow Edge")
+            connection.execute(
+                "INSERT INTO agent_messages (id, run_id, source_node_id, target_node_id, trigger, message_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (uuid4().hex, run_id, request.nodeId, next_node_id, request.trigger, json.dumps(request.result)),
+            )
+            connection.execute(
+                "INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id) VALUES (?, ?, ?)",
+                ("node.completed", run_id, run["crystal_flow_id"]),
+            )
+        return NodeResultResponse(nodeStatus="completed", nextNodeId=next_node_id, message=request.result)
 
     @app.post(
         "/api/crystal-flows/{crystal_flow_id}/runs",

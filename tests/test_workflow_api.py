@@ -352,6 +352,32 @@ def test_ai_node_timeout_is_recorded_in_the_execution_trail(tmp_path):
     assert [event["eventType"] for event in audit.json()] == ["run.created", "ai-node.timeout"]
 
 
+def test_run_routes_a_structured_agent_message_only_to_a_declared_branch(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Adaptive flow"}).json()
+        client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [
+                    {"id": "recon", "type": "recon-agent", "label": "Recon", "position": {"x": 0, "y": 0}, "config": {"branches": {"evidence": "verify"}}},
+                    {"id": "verify", "type": "verification-step", "label": "Verify", "position": {"x": 200, "y": 0}, "config": {}},
+                ],
+                "edges": [{"id": "recon-verify", "source": "recon", "target": "verify"}],
+            },
+        )
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        routed = client.post(
+            f"/api/runs/{run['id']}/node-results",
+            json={"nodeId": "recon", "trigger": "evidence", "result": {"api": "/openapi.json"}},
+        )
+
+    assert routed.status_code == 201
+    assert routed.json()["nodeStatus"] == "completed"
+    assert routed.json()["nextNodeId"] == "verify"
+    assert routed.json()["message"] == {"api": "/openapi.json"}
+
+
 def test_owner_cannot_create_a_crystal_flow_with_a_whitespace_only_name(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 
