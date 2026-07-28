@@ -12,6 +12,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import PolicyEngine, ScopePolicyInput
 
+APPROVED_WORKFLOW_NODE_TYPES = {
+    "recon-agent",
+    "verification-step",
+    "approval-gate",
+    "custom-agent",
+}
+
 
 class CreateCrystalFlowRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -30,6 +37,42 @@ class CrystalFlowResponse(BaseModel):
     version: int
     nodes: list[object]
     edges: list[object]
+
+
+class WorkflowNodeRequest(BaseModel):
+    id: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    position: dict[str, float]
+    config: dict[str, object]
+
+
+class WorkflowEdgeRequest(BaseModel):
+    id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+
+
+class SaveCrystalFlowRequest(BaseModel):
+    nodes: list[WorkflowNodeRequest]
+    edges: list[WorkflowEdgeRequest]
+
+    @model_validator(mode="after")
+    def graph_must_have_valid_edges(self) -> "SaveCrystalFlowRequest":
+        node_ids = {node.id for node in self.nodes}
+        if len(node_ids) != len(self.nodes):
+            raise ValueError("Workflow Nodes must have unique IDs")
+        edge_ids = {edge.id for edge in self.edges}
+        if len(edge_ids) != len(self.edges):
+            raise ValueError("Workflow Edges must have unique IDs")
+        if any(node.type not in APPROVED_WORKFLOW_NODE_TYPES for node in self.nodes):
+            raise ValueError("Workflow Nodes must use an approved node type")
+        for edge in self.edges:
+            if edge.source not in node_ids or edge.target not in node_ids:
+                raise ValueError("Workflow Edges must connect existing Workflow Nodes")
+            if edge.source == edge.target:
+                raise ValueError("Workflow Edges cannot connect a node to itself")
+        return self
 
 
 class RunResponse(BaseModel):
@@ -111,6 +154,14 @@ def _initialize_database(database_path: Path) -> None:
                 status TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS crystal_flow_versions (
+                crystal_flow_id TEXT NOT NULL REFERENCES crystal_flows(id),
+                version INTEGER NOT NULL,
+                nodes_json TEXT NOT NULL,
+                edges_json TEXT NOT NULL,
+                PRIMARY KEY (crystal_flow_id, version)
+            );
+
             CREATE TABLE IF NOT EXISTS execution_trail_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -138,6 +189,11 @@ def _initialize_database(database_path: Path) -> None:
                 decision_status TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
+
+            INSERT OR IGNORE INTO crystal_flow_versions (
+                crystal_flow_id, version, nodes_json, edges_json
+            )
+            SELECT id, 1, '[]', '[]' FROM crystal_flows;
             """
         )
 
@@ -153,6 +209,50 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
     app = FastAPI(title="Adaptive Security Orchestration Platform", lifespan=lifespan)
     policy_engine = PolicyEngine()
 
+    def current_crystal_flow(connection: sqlite3.Connection, crystal_flow_id: str) -> CrystalFlowResponse | None:
+        flow = connection.execute(
+            """
+            SELECT flow.id, flow.name, version.version, version.nodes_json, version.edges_json
+            FROM crystal_flows AS flow
+            JOIN crystal_flow_versions AS version ON version.crystal_flow_id = flow.id
+            WHERE flow.id = ?
+            ORDER BY version.version DESC
+            LIMIT 1
+            """,
+            (crystal_flow_id,),
+        ).fetchone()
+        if flow is None:
+            return None
+        return CrystalFlowResponse(
+            id=flow["id"],
+            name=flow["name"],
+            version=flow["version"],
+            nodes=json.loads(flow["nodes_json"]),
+            edges=json.loads(flow["edges_json"]),
+        )
+
+    def crystal_flow_version(
+        connection: sqlite3.Connection, crystal_flow_id: str, version: int
+    ) -> CrystalFlowResponse | None:
+        flow = connection.execute(
+            """
+            SELECT flow.id, flow.name, version.version, version.nodes_json, version.edges_json
+            FROM crystal_flows AS flow
+            JOIN crystal_flow_versions AS version ON version.crystal_flow_id = flow.id
+            WHERE flow.id = ? AND version.version = ?
+            """,
+            (crystal_flow_id, version),
+        ).fetchone()
+        if flow is None:
+            return None
+        return CrystalFlowResponse(
+            id=flow["id"],
+            name=flow["name"],
+            version=flow["version"],
+            nodes=json.loads(flow["nodes_json"]),
+            edges=json.loads(flow["edges_json"]),
+        )
+
     @app.post(
         "/api/crystal-flows",
         response_model=CrystalFlowResponse,
@@ -165,6 +265,13 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
                 "INSERT INTO crystal_flows (id, name, version) VALUES (?, ?, ?)",
                 (crystal_flow_id, request.name, 1),
             )
+            connection.execute(
+                """
+                INSERT INTO crystal_flow_versions (crystal_flow_id, version, nodes_json, edges_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (crystal_flow_id, 1, "[]", "[]"),
+            )
         return CrystalFlowResponse(
             id=crystal_flow_id,
             name=request.name,
@@ -176,14 +283,21 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
     @app.get("/api/crystal-flows/{crystal_flow_id}", response_model=CrystalFlowResponse)
     def get_crystal_flow(crystal_flow_id: str) -> CrystalFlowResponse:
         with _connect(resolved_database_path) as connection:
-            flow = connection.execute(
-                "SELECT id, name, version FROM crystal_flows WHERE id = ?", (crystal_flow_id,)
-            ).fetchone()
+            flow = current_crystal_flow(connection, crystal_flow_id)
         if flow is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
-        return CrystalFlowResponse(
-            id=flow["id"], name=flow["name"], version=flow["version"], nodes=[], edges=[]
-        )
+        return flow
+
+    @app.get(
+        "/api/crystal-flows/{crystal_flow_id}/versions/{version}",
+        response_model=CrystalFlowResponse,
+    )
+    def get_crystal_flow_version(crystal_flow_id: str, version: int) -> CrystalFlowResponse:
+        with _connect(resolved_database_path) as connection:
+            flow = crystal_flow_version(connection, crystal_flow_id, version)
+        if flow is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow version not found")
+        return flow
 
     @app.get("/api/crystal-flows", response_model=list[CrystalFlowResponse])
     def list_crystal_flows() -> list[CrystalFlowResponse]:
@@ -192,11 +306,35 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
                 "SELECT id, name, version FROM crystal_flows ORDER BY rowid DESC"
             ).fetchall()
         return [
-            CrystalFlowResponse(
-                id=flow["id"], name=flow["name"], version=flow["version"], nodes=[], edges=[]
-            )
+            current_crystal_flow(connection, flow["id"])
             for flow in flows
         ]
+
+    @app.put("/api/crystal-flows/{crystal_flow_id}", response_model=CrystalFlowResponse)
+    def save_crystal_flow(
+        crystal_flow_id: str, request: SaveCrystalFlowRequest
+    ) -> CrystalFlowResponse:
+        with _connect(resolved_database_path) as connection:
+            current_flow = current_crystal_flow(connection, crystal_flow_id)
+            if current_flow is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
+            next_version = current_flow.version + 1
+            nodes = [node.model_dump() for node in request.nodes]
+            edges = [edge.model_dump() for edge in request.edges]
+            connection.execute(
+                """
+                INSERT INTO crystal_flow_versions (crystal_flow_id, version, nodes_json, edges_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (crystal_flow_id, next_version, json.dumps(nodes), json.dumps(edges)),
+            )
+        return CrystalFlowResponse(
+            id=current_flow.id,
+            name=current_flow.name,
+            version=next_version,
+            nodes=nodes,
+            edges=edges,
+        )
 
     @app.post("/api/scopes", response_model=ScopeResponse, status_code=status.HTTP_201_CREATED)
     def create_scope(request: CreateScopeRequest) -> ScopeResponse:

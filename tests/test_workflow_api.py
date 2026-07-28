@@ -46,6 +46,100 @@ def test_owner_can_create_reopen_and_run_a_blank_crystal_flow(tmp_path):
         ]
 
 
+def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        created = client.post("/api/crystal-flows", json={"name": "API assessment"}).json()
+        saved = client.put(
+            f"/api/crystal-flows/{created['id']}",
+            json={
+                "nodes": [
+                    {
+                        "id": "recon-1",
+                        "type": "recon-agent",
+                        "label": "Discover API surface",
+                        "position": {"x": 80, "y": 80},
+                        "config": {"target": "https://lab.example.test"},
+                    },
+                    {
+                        "id": "verify-1",
+                        "type": "verification-step",
+                        "label": "Verify result",
+                        "position": {"x": 360, "y": 80},
+                        "config": {},
+                    },
+                ],
+                "edges": [{"id": "recon-to-verify", "source": "recon-1", "target": "verify-1"}],
+            },
+        )
+
+        assert saved.status_code == 200
+        assert saved.json()["version"] == 2
+        assert saved.json()["nodes"][0]["label"] == "Discover API surface"
+        assert saved.json()["edges"] == [
+            {"id": "recon-to-verify", "source": "recon-1", "target": "verify-1"}
+        ]
+
+        reopened = client.get(f"/api/crystal-flows/{created['id']}")
+        assert reopened.status_code == 200
+        assert reopened.json() == saved.json()
+
+        original = client.get(f"/api/crystal-flows/{created['id']}/versions/1")
+        assert original.status_code == 200
+        assert original.json()["version"] == 1
+        assert original.json()["nodes"] == []
+        assert original.json()["edges"] == []
+
+
+def test_owner_cannot_save_a_branch_to_a_missing_workflow_node(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        created = client.post("/api/crystal-flows", json={"name": "Invalid graph"}).json()
+        saved = client.put(
+            f"/api/crystal-flows/{created['id']}",
+            json={
+                "nodes": [
+                    {
+                        "id": "recon-1",
+                        "type": "recon-agent",
+                        "label": "Recon",
+                        "position": {"x": 0, "y": 0},
+                        "config": {},
+                    }
+                ],
+                "edges": [{"id": "invalid", "source": "recon-1", "target": "missing"}],
+            },
+        )
+
+    assert saved.status_code == 422
+
+
+def test_owner_cannot_save_an_unapproved_workflow_node_type(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        created = client.post("/api/crystal-flows", json={"name": "Unapproved node"}).json()
+        saved = client.put(
+            f"/api/crystal-flows/{created['id']}",
+            json={
+                "nodes": [
+                    {
+                        "id": "unknown-1",
+                        "type": "unapproved-agent",
+                        "label": "Unapproved",
+                        "position": {"x": 0, "y": 0},
+                        "config": {},
+                    }
+                ],
+                "edges": [],
+            },
+        )
+
+    assert saved.status_code == 422
+
+
 def test_owner_cannot_create_a_crystal_flow_with_a_whitespace_only_name(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 

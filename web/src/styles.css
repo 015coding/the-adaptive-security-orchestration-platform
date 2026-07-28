@@ -25,3 +25,18 @@ button { background: #71d8b2; border: 0; border-radius: 6px; color: #082016; cur
 
 .saved-flows { list-style: none; margin: 0; padding: 0; }
 .saved-flows li { align-items: center; display: flex; gap: 1rem; justify-content: space-between; padding: 0.5rem 0; }
+
+.canvas-heading { align-items: flex-start; display: flex; gap: 1rem; justify-content: space-between; }
+.workflow-editor { display: grid; gap: 1rem; grid-template-columns: 150px minmax(360px, 1fr) 180px; margin-top: 1rem; }
+.canvas { border: 1px solid #2a4658; border-radius: 8px; height: 460px; overflow: hidden; }
+.node-palette, .node-config { background: #0d1720; border: 1px solid #2a4658; border-radius: 8px; padding: 0.75rem; }
+.node-palette h3, .node-config h3 { font-size: 0.9rem; margin-bottom: 0.75rem; }
+.node-palette button { margin-bottom: 0.5rem; width: 100%; }
+
+@media (max-width: 760px) {
+  .canvas-heading, .workflow-editor { display: flex; flex-direction: column; }
+  .canvas { min-height: 360px; width: 100%; }
+  .node-palette { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .node-palette h3 { width: 100%; }
+  .node-palette button { width: auto; }
+}
