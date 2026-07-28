@@ -575,7 +575,7 @@ export function App() {
     invocation.nodeId === selectedNode.id
   )) : [];
 
-  async function refreshRunDetails(runId: string) {
+  async function refreshRunDetails(runId: string): Promise<string | null> {
     try {
       const [nextRun, nextAudit, nextStatuses, nextMessages, nextInvocations, nextFindings] = await Promise.all([
         request<WorkflowRun>(`/api/runs/${runId}`),
@@ -591,17 +591,31 @@ export function App() {
       setAgentMessages(nextMessages);
       setAiNodeInvocations(nextInvocations);
       setFindings(nextFindings);
+      return nextRun.status;
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to refresh run details");
+      return null;
     }
   }
 
   useEffect(() => {
     if (!run) return undefined;
-    void refreshRunDetails(run.id);
-    const intervalId = window.setInterval(() => void refreshRunDetails(run.id), 2000);
-    return () => window.clearInterval(intervalId);
-  }, [run]);
+    let cancelled = false;
+    let timeoutId: number | undefined;
+    const terminalStatuses = new Set(["completed", "failed", "blocked", "waiting-for-approval", "timeout", "resource-exceeded"]);
+
+    const poll = async () => {
+      const status = await refreshRunDetails(run.id);
+      if (cancelled || (status && terminalStatuses.has(status))) return;
+      timeoutId = window.setTimeout(() => void poll(), 2000);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+    };
+  }, [run?.id]);
 
   const onConnect: OnConnect = (connection: Connection) => {
     if (!connection.source || !connection.target || connection.source === connection.target) return;
