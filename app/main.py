@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime
+import json
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.policy import PolicyEngine, ScopePolicyInput
 
 
 class CreateCrystalFlowRequest(BaseModel):
@@ -40,6 +44,50 @@ class AuditEventResponse(BaseModel):
     crystalFlowId: str
 
 
+class ResourceLimitsRequest(BaseModel):
+    maxRequestsPerSecond: int = Field(ge=1)
+    maxConcurrentTasks: int = Field(ge=1)
+    maxRuntimeSeconds: int = Field(ge=1)
+
+
+class CreateScopeRequest(BaseModel):
+    targets: list[str] = Field(min_length=1)
+    workspace: str = Field(min_length=1)
+    allowedActions: list[str] = Field(min_length=1)
+    resourceLimits: ResourceLimitsRequest
+    startsAt: datetime
+    expiresAt: datetime
+    unattendedExecution: bool
+    authorizedLabEnvironment: bool
+
+    @model_validator(mode="after")
+    def scope_window_must_be_valid(self) -> "CreateScopeRequest":
+        if self.startsAt.tzinfo is None or self.expiresAt.tzinfo is None:
+            raise ValueError("Scope Window timestamps must include a timezone")
+        if self.startsAt >= self.expiresAt:
+            raise ValueError("Scope Window must expire after it starts")
+        return self
+
+
+class ScopeResponse(BaseModel):
+    id: str
+
+
+class CreatePolicyDecisionRequest(BaseModel):
+    scopeId: str
+    target: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+
+
+class PolicyDecisionResponse(BaseModel):
+    id: str
+    scopeId: str
+    target: str
+    action: str
+    status: str
+    reason: str
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -69,6 +117,27 @@ def _initialize_database(database_path: Path) -> None:
                 run_id TEXT NOT NULL REFERENCES workflow_runs(id),
                 crystal_flow_id TEXT NOT NULL REFERENCES crystal_flows(id)
             );
+
+            CREATE TABLE IF NOT EXISTS scopes (
+                id TEXT PRIMARY KEY,
+                targets_json TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                allowed_actions_json TEXT NOT NULL,
+                resource_limits_json TEXT NOT NULL,
+                starts_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                unattended_execution INTEGER NOT NULL,
+                authorized_lab_environment INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_decisions (
+                id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL REFERENCES scopes(id),
+                target TEXT NOT NULL,
+                action TEXT NOT NULL,
+                decision_status TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
             """
         )
 
@@ -82,6 +151,7 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
         yield
 
     app = FastAPI(title="Adaptive Security Orchestration Platform", lifespan=lifespan)
+    policy_engine = PolicyEngine()
 
     @app.post(
         "/api/crystal-flows",
@@ -126,6 +196,96 @@ def create_app(database_path: Path | str = Path("data/platform.db")) -> FastAPI:
                 id=flow["id"], name=flow["name"], version=flow["version"], nodes=[], edges=[]
             )
             for flow in flows
+        ]
+
+    @app.post("/api/scopes", response_model=ScopeResponse, status_code=status.HTTP_201_CREATED)
+    def create_scope(request: CreateScopeRequest) -> ScopeResponse:
+        scope_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO scopes (
+                    id, targets_json, workspace, allowed_actions_json, resource_limits_json,
+                    starts_at, expires_at, unattended_execution, authorized_lab_environment
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_id,
+                    json.dumps(request.targets),
+                    request.workspace,
+                    json.dumps(request.allowedActions),
+                    request.resourceLimits.model_dump_json(),
+                    request.startsAt.isoformat(),
+                    request.expiresAt.isoformat(),
+                    request.unattendedExecution,
+                    request.authorizedLabEnvironment,
+                ),
+            )
+        return ScopeResponse(id=scope_id)
+
+    @app.post(
+        "/api/policy-decisions",
+        response_model=PolicyDecisionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def evaluate_policy(request: CreatePolicyDecisionRequest) -> PolicyDecisionResponse:
+        with _connect(resolved_database_path) as connection:
+            scope = connection.execute("SELECT * FROM scopes WHERE id = ?", (request.scopeId,)).fetchone()
+            if scope is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+            outcome = policy_engine.evaluate(
+                ScopePolicyInput(
+                    targets=tuple(json.loads(scope["targets_json"])),
+                    allowed_actions=tuple(json.loads(scope["allowed_actions_json"])),
+                    starts_at=datetime.fromisoformat(scope["starts_at"]),
+                    expires_at=datetime.fromisoformat(scope["expires_at"]),
+                    unattended_execution=bool(scope["unattended_execution"]),
+                    authorized_lab_environment=bool(scope["authorized_lab_environment"]),
+                ),
+                target=request.target,
+                action=request.action,
+            )
+            decision_id = uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO policy_decisions (id, scope_id, target, action, decision_status, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (decision_id, request.scopeId, request.target, request.action, outcome.status, outcome.reason),
+            )
+        return PolicyDecisionResponse(
+            id=decision_id,
+            scopeId=request.scopeId,
+            target=request.target,
+            action=request.action,
+            status=outcome.status,
+            reason=outcome.reason,
+        )
+
+    @app.get(
+        "/api/scopes/{scope_id}/policy-decisions", response_model=list[PolicyDecisionResponse]
+    )
+    def list_policy_decisions(scope_id: str) -> list[PolicyDecisionResponse]:
+        with _connect(resolved_database_path) as connection:
+            decisions = connection.execute(
+                """
+                SELECT id, scope_id, target, action, decision_status, reason
+                FROM policy_decisions
+                WHERE scope_id = ?
+                ORDER BY rowid
+                """,
+                (scope_id,),
+            ).fetchall()
+        return [
+            PolicyDecisionResponse(
+                id=decision["id"],
+                scopeId=decision["scope_id"],
+                target=decision["target"],
+                action=decision["action"],
+                status=decision["decision_status"],
+                reason=decision["reason"],
+            )
+            for decision in decisions
         ]
 
     @app.post(
