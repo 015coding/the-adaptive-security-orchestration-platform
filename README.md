@@ -22,7 +22,8 @@ Open the URL printed by Vite. The UI creates a Crystal Flow, edits its Workflow 
 
 ## Configure isolated VM execution
 
-Set the SSH targets for the dedicated, restricted VM accounts before starting the API:
+SSH targets can be configured from `/ctf-setup`. Environment variables remain
+available as optional bootstrap defaults:
 
 ```sh
 # Values may be normal SSH config aliases:
@@ -36,6 +37,17 @@ the Owner host's `~/.ssh/config` and verify `ssh codex-kali` works before
 starting a run.
 
 The remote `assessment-runner` account must be restricted by the VM configuration to its assigned Run Workspace and approved network targets. The host API passes only the Scope-derived workspace and timeout to SSH; it does not grant the Owner host filesystem to VM tasks.
+
+## Configure a CTF challenge from the UI
+
+Open `/ctf-setup` to configure the Instance target, VM Workspace, Kali or Debian
+SSH alias, Scope Window, resource limits, exploitation permission, Human
+Approval Bypass, model, and reasoning effort. Submitting the form persists and
+audits the SSH environment, creates the Scope, and creates a versioned Crystal
+Flow with the corresponding policy and approval structure.
+
+Challenge files are intentionally not uploaded by this page. Copy them to the
+declared VM Workspace separately and keep large or raw files VM-resident.
 
 ## Configure the Codex CLI Session Adapter
 

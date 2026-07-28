@@ -254,6 +254,26 @@ class ReferenceCatalogResponse(BaseModel):
     benchmarkFlowId: str
 
 
+class ExecutionEnvironmentRequest(BaseModel):
+    sshTarget: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._@:-]*$",
+    )
+
+
+class ExecutionEnvironmentResponse(BaseModel):
+    environment: Literal["kali", "debian"]
+    sshTarget: str
+
+
+class ConfigurationAuditEventResponse(BaseModel):
+    eventType: str
+    subject: str
+    detail: dict[str, object]
+    createdAt: datetime
+
+
 class BenchmarkFlowResponse(BaseModel):
     crystalFlowId: str
     demonstrates: list[str]
@@ -562,6 +582,19 @@ def _initialize_database(database_path: Path) -> None:
                 demonstrates_json TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS execution_environments (
+                environment TEXT PRIMARY KEY,
+                ssh_target TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS configuration_audit_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS evidence_records (
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES workflow_runs(id),
@@ -674,6 +707,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         _initialize_database(resolved_database_path)
+        configure_environment = getattr(configured_vm_runner, "configure", None)
+        if callable(configure_environment):
+            with _connect(resolved_database_path) as connection:
+                environments = connection.execute(
+                    "SELECT environment, ssh_target FROM execution_environments"
+                ).fetchall()
+            for environment in environments:
+                configure_environment(environment["environment"], environment["ssh_target"])
         yield
 
     app = FastAPI(title="Adaptive Security Orchestration Platform", lifespan=lifespan)
@@ -1139,6 +1180,91 @@ def create_app(
                 """
             ).fetchall()
         return [custom_agent_response(agent) for agent in agents]
+
+    @app.get(
+        "/api/execution-environments",
+        response_model=list[ExecutionEnvironmentResponse],
+    )
+    def list_execution_environments() -> list[ExecutionEnvironmentResponse]:
+        with _connect(resolved_database_path) as connection:
+            stored = {
+                row["environment"]: row["ssh_target"]
+                for row in connection.execute(
+                    "SELECT environment, ssh_target FROM execution_environments"
+                ).fetchall()
+            }
+        configured_targets = getattr(configured_vm_runner, "configured_targets", None)
+        if callable(configured_targets):
+            for environment, ssh_target in configured_targets().items():
+                if ssh_target:
+                    stored.setdefault(environment, ssh_target)
+        return [
+            ExecutionEnvironmentResponse(environment=environment, sshTarget=stored.get(environment, ""))
+            for environment in ("kali", "debian")
+            if stored.get(environment)
+        ]
+
+    @app.put(
+        "/api/execution-environments/{environment}",
+        response_model=ExecutionEnvironmentResponse,
+    )
+    def configure_execution_environment(
+        environment: Literal["kali", "debian"],
+        request: ExecutionEnvironmentRequest,
+    ) -> ExecutionEnvironmentResponse:
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_environments (environment, ssh_target)
+                VALUES (?, ?)
+                ON CONFLICT(environment) DO UPDATE SET ssh_target = excluded.ssh_target
+                """,
+                (environment, request.sshTarget),
+            )
+            connection.execute(
+                """
+                INSERT INTO configuration_audit_events (
+                    id, event_type, subject, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    "execution-environment.configured",
+                    environment,
+                    json.dumps({"sshTarget": request.sshTarget}),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        configure_environment = getattr(configured_vm_runner, "configure", None)
+        if callable(configure_environment):
+            configure_environment(environment, request.sshTarget)
+        return ExecutionEnvironmentResponse(
+            environment=environment,
+            sshTarget=request.sshTarget,
+        )
+
+    @app.get(
+        "/api/configuration-audit",
+        response_model=list[ConfigurationAuditEventResponse],
+    )
+    def list_configuration_audit_events() -> list[ConfigurationAuditEventResponse]:
+        with _connect(resolved_database_path) as connection:
+            events = connection.execute(
+                """
+                SELECT event_type, subject, detail_json, created_at
+                FROM configuration_audit_events
+                ORDER BY rowid DESC
+                """
+            ).fetchall()
+        return [
+            ConfigurationAuditEventResponse(
+                eventType=event["event_type"],
+                subject=event["subject"],
+                detail=json.loads(event["detail_json"]),
+                createdAt=datetime.fromisoformat(event["created_at"]),
+            )
+            for event in events
+        ]
 
     @app.get("/api/benchmark-flows", response_model=list[BenchmarkFlowResponse])
     def list_benchmark_flows() -> list[BenchmarkFlowResponse]:

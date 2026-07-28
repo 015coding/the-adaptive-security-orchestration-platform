@@ -100,6 +100,16 @@ type ReferenceCatalog = {
   benchmarkFlowId: string;
 };
 
+type ScopeResponse = {
+  id: string;
+  version: number;
+};
+
+type ExecutionEnvironment = {
+  environment: "kali" | "debian";
+  sshTarget: string;
+};
+
 const palette: Array<{ kind: NodeKind; label: string }> = [
   { kind: "recon-agent", label: "Recon Agent" },
   { kind: "verification-step", label: "Verification Step" },
@@ -167,6 +177,195 @@ function InspectionList({ label, values }: { label: string; values: string[] }) 
   );
 }
 
+function localDateTimeValue(date: Date): string {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void }) {
+  const [challengeName, setChallengeName] = useState("CTF assessment");
+  const [target, setTarget] = useState("");
+  const [workspace, setWorkspace] = useState("/srv/crystal-flow/ctf-01");
+  const [environment, setEnvironment] = useState<"kali" | "debian">("kali");
+  const [sshTarget, setSshTarget] = useState("codex-kali");
+  const [startsAt, setStartsAt] = useState(localDateTimeValue(new Date()));
+  const [expiresAt, setExpiresAt] = useState(localDateTimeValue(new Date(Date.now() + 4 * 60 * 60 * 1000)));
+  const [maxRequestsPerSecond, setMaxRequestsPerSecond] = useState(5);
+  const [maxConcurrentTasks, setMaxConcurrentTasks] = useState(1);
+  const [maxRuntimeSeconds, setMaxRuntimeSeconds] = useState(600);
+  const [authorizedLab, setAuthorizedLab] = useState(true);
+  const [includeExploitation, setIncludeExploitation] = useState(false);
+  const [unattendedExecution, setUnattendedExecution] = useState(false);
+  const [model, setModel] = useState("gpt-5.6-terra");
+  const [reasoningEffort, setReasoningEffort] = useState("medium");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [configuredEnvironments, setConfiguredEnvironments] = useState<ExecutionEnvironment[]>([]);
+
+  useEffect(() => {
+    request<ExecutionEnvironment[]>("/api/execution-environments")
+      .then((environments) => {
+        setConfiguredEnvironments(environments);
+        const configured = environments.find((item) => item.environment === environment);
+        if (configured) setSshTarget(configured.sshTarget);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  function changeEnvironment(nextEnvironment: "kali" | "debian") {
+    setEnvironment(nextEnvironment);
+    setSshTarget(
+      configuredEnvironments.find((item) => item.environment === nextEnvironment)?.sshTarget
+      ?? (nextEnvironment === "kali" ? "codex-kali" : "codex-debian"),
+    );
+  }
+
+  async function createCtfWorkspace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFormError(null);
+    if (new Date(startsAt) >= new Date(expiresAt)) {
+      setFormError("Expiry time must be later than the start time.");
+      return;
+    }
+    if (includeExploitation && !authorizedLab) {
+      setFormError("Exploitation can only be enabled for an authorized lab environment.");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      await request<ExecutionEnvironment>(`/api/execution-environments/${environment}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sshTarget }),
+      });
+      const allowedActions = ["reconnaissance", "verification"];
+      if (includeExploitation) allowedActions.push("exploitation-attempt");
+      const scope = await request<ScopeResponse>("/api/scopes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          targets: [target],
+          workspace,
+          allowedActions,
+          resourceLimits: { maxRequestsPerSecond, maxConcurrentTasks, maxRuntimeSeconds },
+          startsAt: new Date(startsAt).toISOString(),
+          expiresAt: new Date(expiresAt).toISOString(),
+          unattendedExecution,
+          authorizedLabEnvironment: authorizedLab,
+        }),
+      });
+      const created = await request<CrystalFlow>("/api/crystal-flows", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: challengeName }),
+      });
+      const approvalRequired = includeExploitation && !unattendedExecution;
+      const reconTarget = approvalRequired ? "ctf-approval" : "ctf-verification";
+      const nodes: CrystalFlow["nodes"] = [
+        {
+          id: "ctf-recon",
+          type: "recon-agent",
+          label: "CTF Recon Agent",
+          position: { x: 80, y: 120 },
+          config: {
+            scopeId: scope.id, target, workspace, environment, sshTarget, model, reasoningEffort,
+            action: "reconnaissance", branches: { completed: reconTarget },
+          },
+        },
+        {
+          id: "ctf-verification",
+          type: "verification-step",
+          label: includeExploitation ? "Exploit & Verify" : "CTF Verification",
+          position: { x: approvalRequired ? 600 : 360, y: 120 },
+          config: {
+            scopeId: scope.id, target, workspace, environment, sshTarget, model, reasoningEffort,
+            action: includeExploitation ? "exploitation-attempt" : "verification",
+          },
+        },
+      ];
+      const edges: CrystalFlow["edges"] = [];
+      if (approvalRequired) {
+        nodes.splice(1, 0, {
+          id: "ctf-approval",
+          type: "approval-gate",
+          label: "Owner Approval",
+          position: { x: 340, y: 120 },
+          config: { scopeId: scope.id, branches: { approved: "ctf-verification" } },
+        });
+        edges.push(
+          { id: "ctf-recon-approval", source: "ctf-recon", target: "ctf-approval" },
+          { id: "ctf-approval-verification", source: "ctf-approval", target: "ctf-verification" },
+        );
+      } else {
+        edges.push({ id: "ctf-recon-verification", source: "ctf-recon", target: "ctf-verification" });
+      }
+      const saved = await request<CrystalFlow>(`/api/crystal-flows/${created.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nodes, edges }),
+      });
+      onCreated(saved);
+    } catch (requestError) {
+      setFormError(requestError instanceof Error ? requestError.message : "Unable to create CTF setup");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="section-page ctf-setup-page">
+      <div className="page-intro">
+        <span>AUTHORIZED LAB CONFIGURATION</span>
+        <h2>CTF Challenge Setup</h2>
+        <p>Configure the Instance, isolated VM, Scope, runtime limits, approvals, and AI profile. Challenge files remain outside this form and can be copied into the declared VM Workspace separately.</p>
+      </div>
+      <form className="ctf-form" onSubmit={createCtfWorkspace}>
+        <section className="page-card">
+          <div className="page-card-heading"><span>CHALLENGE</span><b>01</b></div>
+          <div className="form-grid">
+            <label><span>Challenge name</span><input required value={challengeName} onChange={(event) => setChallengeName(event.target.value)} /></label>
+            <label><span>Instance target</span><input placeholder="http://10.10.10.50:8080" required value={target} onChange={(event) => setTarget(event.target.value)} /></label>
+          </div>
+        </section>
+        <section className="page-card">
+          <div className="page-card-heading"><span>ISOLATED EXECUTION</span><b>02</b></div>
+          <div className="form-grid three">
+            <label><span>Environment</span><select value={environment} onChange={(event) => changeEnvironment(event.target.value as "kali" | "debian")}><option value="kali">Kali VM</option><option value="debian">Debian VM</option></select></label>
+            <label><span>SSH alias</span><input required value={sshTarget} onChange={(event) => setSshTarget(event.target.value)} /></label>
+            <label className="wide"><span>VM Workspace</span><input required value={workspace} onChange={(event) => setWorkspace(event.target.value)} /></label>
+          </div>
+          <p className="form-note">The SSH alias is saved to the Backend and takes effect immediately. The Workspace must already exist inside the selected VM.</p>
+        </section>
+        <section className="page-card">
+          <div className="page-card-heading"><span>SCOPE WINDOW &amp; LIMITS</span><b>03</b></div>
+          <div className="form-grid three">
+            <label><span>Starts at</span><input required type="datetime-local" value={startsAt} onChange={(event) => setStartsAt(event.target.value)} /></label>
+            <label><span>Expires at</span><input required type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} /></label>
+            <label><span>Requests / second</span><input min="1" required type="number" value={maxRequestsPerSecond} onChange={(event) => setMaxRequestsPerSecond(Number(event.target.value))} /></label>
+            <label><span>Concurrent tasks</span><input min="1" required type="number" value={maxConcurrentTasks} onChange={(event) => setMaxConcurrentTasks(Number(event.target.value))} /></label>
+            <label><span>Task timeout (seconds)</span><input min="1" required type="number" value={maxRuntimeSeconds} onChange={(event) => setMaxRuntimeSeconds(Number(event.target.value))} /></label>
+          </div>
+        </section>
+        <section className="page-card">
+          <div className="page-card-heading"><span>GOVERNANCE &amp; AI</span><b>04</b></div>
+          <div className="form-grid">
+            <label><span>Node model</span><select value={model} onChange={(event) => setModel(event.target.value)}><option value="gpt-5.6-sol">GPT-5.6 Sol</option><option value="gpt-5.6-terra">GPT-5.6 Terra</option><option value="gpt-5.6-luna">GPT-5.6 Luna</option></select></label>
+            <label><span>Reasoning effort</span><select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option></select></label>
+          </div>
+          <div className="toggle-grid">
+            <label><input checked={authorizedLab} onChange={(event) => { setAuthorizedLab(event.target.checked); if (!event.target.checked) setUnattendedExecution(false); }} type="checkbox" /><span><strong>Authorized lab</strong><small>Confirm this Instance is an explicitly authorized CTF environment.</small></span></label>
+            <label><input checked={includeExploitation} onChange={(event) => setIncludeExploitation(event.target.checked)} type="checkbox" /><span><strong>Allow exploitation attempts</strong><small>Add exploitation to Scope and generated Flow.</small></span></label>
+            <label className={!authorizedLab ? "is-disabled" : ""}><input checked={unattendedExecution} disabled={!authorizedLab} onChange={(event) => setUnattendedExecution(event.target.checked)} type="checkbox" /><span><strong>Human Approval Bypass</strong><small>Allow unattended execution inside this exact authorized Scope.</small></span></label>
+          </div>
+        </section>
+        {formError && <div className="form-error" role="alert">{formError}</div>}
+        <div className="ctf-form-actions"><span>Files are not uploaded by this page.</span><button className="button primary" disabled={submitting} type="submit">{submitting ? "Creating…" : "Create Scope & Crystal Flow"}</button></div>
+      </form>
+    </main>
+  );
+}
+
 function keepValidBranches(workflowNodes: WorkflowNode[], workflowEdges: Edge[]): WorkflowNode[] {
   const validRoutes = new Set(workflowEdges.map((edge) => `${edge.source}\0${edge.target}`));
   return workflowNodes.map((node) => {
@@ -203,7 +402,9 @@ function keepValidBranches(workflowNodes: WorkflowNode[], workflowEdges: Edge[])
 
 export function App() {
   const [pathname, setPathname] = useState(window.location.pathname);
-  const page = pathname.startsWith("/runs")
+  const page = pathname.startsWith("/ctf-setup")
+    ? "ctf"
+    : pathname.startsWith("/runs")
     ? "runs"
     : pathname.startsWith("/findings")
       ? "findings"
@@ -215,6 +416,7 @@ export function App() {
     : null;
   const pageTitle = {
     workflows: "Workflow Studio",
+    ctf: "CTF Challenge Setup",
     runs: "Run History",
     findings: "Findings",
     policy: "Policy & Scope",
@@ -556,6 +758,7 @@ export function App() {
 
         <nav className="primary-nav" aria-label="Primary navigation">
           <a className={`nav-item ${page === "workflows" ? "is-active" : ""}`} href="/workflows" onClick={(event) => { event.preventDefault(); navigate("/workflows"); }}><span className="nav-icon">⌘</span>Workflow Studio</a>
+          <a className={`nav-item ${page === "ctf" ? "is-active" : ""}`} href="/ctf-setup" onClick={(event) => { event.preventDefault(); navigate("/ctf-setup"); }}><span className="nav-icon">＋</span>CTF Setup</a>
           <a className={`nav-item ${page === "runs" ? "is-active" : ""}`} href="/runs" onClick={(event) => { event.preventDefault(); navigate("/runs"); }}><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></a>
           <a className={`nav-item ${page === "findings" ? "is-active" : ""}`} href="/findings" onClick={(event) => { event.preventDefault(); navigate("/findings"); }}><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></a>
           <a className={`nav-item ${page === "policy" ? "is-active" : ""}`} href="/policy" onClick={(event) => { event.preventDefault(); navigate("/policy"); }}><span className="nav-icon">✓</span>Policy &amp; Scope</a>
@@ -621,7 +824,12 @@ export function App() {
 
         {error && <div className="error-toast" role="alert"><strong>Action failed</strong><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
 
-        {page === "runs" ? (
+        {page === "ctf" ? (
+          <CtfSetupPage onCreated={(createdFlow) => {
+            setSavedFlows((flows) => [createdFlow, ...flows.filter((item) => item.id !== createdFlow.id)]);
+            openFlow(createdFlow);
+          }} />
+        ) : page === "runs" ? (
           <main className="section-page">
             <div className="page-intro"><span>EXECUTION OPERATIONS</span><h2>Run History</h2><p>Review the current execution state and its auditable events. Run data remains attached to its originating Crystal Flow.</p></div>
             <div className="page-card">

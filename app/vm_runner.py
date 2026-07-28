@@ -32,6 +32,12 @@ class SshVmRunner:
             }
         )
 
+    def configure(self, environment: str, ssh_target: str) -> None:
+        self._environments[environment] = ssh_target
+
+    def configured_targets(self) -> dict[str, str]:
+        return dict(self._environments)
+
     def execute(
         self, *, environment: str, workspace: str, command: list[str], timeout_seconds: int
     ) -> VmCommandResult:

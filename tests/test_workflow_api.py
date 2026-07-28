@@ -11,6 +11,13 @@ from app.vm_runner import VmCommandResult
 class ControlledVmRunner:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.environments: dict[str, str] = {}
+
+    def configure(self, environment: str, ssh_target: str) -> None:
+        self.environments[environment] = ssh_target
+
+    def configured_targets(self) -> dict[str, str]:
+        return dict(self.environments)
 
     def execute(
         self, *, environment: str, workspace: str, command: list[str], timeout_seconds: int
@@ -492,6 +499,38 @@ def test_permitted_vm_task_runs_in_the_scope_workspace_and_returns_a_host_log_bu
         logs = client.get(f"/api/scopes/{scope['id']}/run-log-bundles")
         assert logs.status_code == 200
         assert logs.json() == [task.json()]
+
+
+def test_owner_can_configure_and_audit_an_ssh_execution_environment(tmp_path):
+    runner = ControlledVmRunner()
+    database_path = tmp_path / "platform.db"
+    app = create_app(database_path=database_path, vm_runner=runner)
+
+    with TestClient(app) as client:
+        configured = client.put(
+            "/api/execution-environments/kali",
+            json={"sshTarget": "codex-kali"},
+        )
+
+        assert configured.status_code == 200
+        assert configured.json() == {
+            "environment": "kali",
+            "sshTarget": "codex-kali",
+        }
+        assert runner.environments == {"kali": "codex-kali"}
+        assert client.get("/api/execution-environments").json() == [configured.json()]
+        audit_event = client.get("/api/configuration-audit").json()[0]
+        assert audit_event == {
+            "eventType": "execution-environment.configured",
+            "subject": "kali",
+            "detail": {"sshTarget": "codex-kali"},
+            "createdAt": audit_event["createdAt"],
+        }
+
+    restarted_runner = ControlledVmRunner()
+    restarted_app = create_app(database_path=database_path, vm_runner=restarted_runner)
+    with TestClient(restarted_app):
+        assert restarted_runner.environments == {"kali": "codex-kali"}
 
 
 def test_out_of_scope_vm_task_is_blocked_without_calling_the_vm_runner(tmp_path):

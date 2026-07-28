@@ -298,6 +298,7 @@ select:hover, select:focus { border-color: var(--cyan); }
 }
 
 .button:hover { filter: brightness(1.12); }
+.button:disabled { cursor: wait; filter: grayscale(0.35); opacity: 0.62; }
 .button.primary { border-color: #38c9bf; color: #06191a; background: var(--cyan); }
 .button.secondary { background: #10202d; }
 .button.danger { border-color: rgba(239, 107, 114, 0.35); color: #ef969b; background: rgba(239, 107, 114, 0.08); }
@@ -453,6 +454,39 @@ select:hover, select:focus { border-color: var(--cyan); }
 .control-list { display: grid; gap: 8px; margin: 0; padding: 0; color: #8196a5; font-size: 10px; list-style: none; }
 .control-list li { position: relative; padding: 7px 9px 7px 27px; border: 1px solid #1c3242; border-radius: 5px; background: #0c1a25; }
 .control-list li::before { content: "✓"; position: absolute; left: 9px; color: var(--green); }
+
+.ctf-setup-page { padding-top: 34px; }
+.ctf-setup-page .page-intro { margin-bottom: 18px; }
+.ctf-form { display: grid; gap: 12px; max-width: 1040px; }
+.ctf-form .page-card { padding: 16px; }
+.ctf-form .page-card-heading { margin-bottom: 13px; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.form-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.form-grid label { display: block; min-width: 0; }
+.form-grid label > span { display: block; margin-bottom: 6px; color: #6f8798; font-size: 9px; font-weight: 700; }
+.form-grid input, .form-grid select { width: 100%; min-height: 36px; }
+.form-grid .wide { grid-column: span 2; }
+.form-note { margin: 10px 0 0; color: #577083; font-size: 8px; line-height: 1.55; }
+
+.toggle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+.toggle-grid > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid #1c3343;
+  border-radius: 6px;
+  background: #0c1a25;
+  cursor: pointer;
+}
+.toggle-grid > label.is-disabled { cursor: not-allowed; opacity: 0.48; }
+.toggle-grid input { flex: 0 0 auto; width: 14px; height: 14px; margin: 1px 0 0; accent-color: var(--cyan); }
+.toggle-grid strong, .toggle-grid small { display: block; }
+.toggle-grid strong { color: #aabfcb; font-size: 9px; }
+.toggle-grid small { margin-top: 4px; color: #587184; font-size: 8px; line-height: 1.45; }
+.form-error { padding: 10px 12px; border: 1px solid rgba(239, 107, 114, 0.4); border-radius: 6px; color: #ef9da2; background: rgba(239, 107, 114, 0.08); font-size: 9px; }
+.ctf-form-actions { display: flex; align-items: center; justify-content: space-between; padding: 4px 0 20px; }
+.ctf-form-actions > span { color: #5d7587; font-size: 8px; }
 
 .studio-workspace {
   display: flex;
@@ -857,6 +891,8 @@ select:hover, select:focus { border-color: var(--cyan); }
 [data-theme="light"] .page-finding-list strong,
 [data-theme="light"] .policy-grid h3 { color: #2d4a5a; }
 [data-theme="light"] .policy-grid code { color: #076c69; background: #f3f8f9; }
+[data-theme="light"] .toggle-grid > label { background: #f7fafb; border-color: #d3e0e6; }
+[data-theme="light"] .toggle-grid strong { color: #345160; }
 
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 210px minmax(0, 1fr); }
@@ -893,6 +929,7 @@ select:hover, select:focus { border-color: var(--cyan); }
   .empty-workspace { padding: 24px 14px; }
   .section-page { padding: 24px 14px; }
   .policy-grid { grid-template-columns: 1fr; }
+  .form-grid.three, .toggle-grid { grid-template-columns: 1fr 1fr; }
   .welcome-actions { align-items: flex-start; flex-direction: column; }
 }
 
@@ -902,6 +939,9 @@ select:hover, select:focus { border-color: var(--cyan); }
   .studio-toolbar { padding: 0 8px; }
   .flow-meta span:nth-child(2), .flow-meta span:nth-child(3) { display: none; }
   .palette-list { grid-template-columns: 1fr; }
+  .form-grid, .form-grid.three, .toggle-grid { grid-template-columns: 1fr; }
+  .form-grid .wide { grid-column: auto; }
+  .ctf-form-actions { align-items: stretch; flex-direction: column; gap: 10px; }
   .welcome-card { padding: 28px 20px; }
   .welcome-card h2 { font-size: 29px; }
 }
