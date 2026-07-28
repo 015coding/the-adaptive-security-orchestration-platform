@@ -204,6 +204,8 @@ def test_finding_reconstructs_run_provenance_and_keeps_sensitive_vm_evidence_mas
         masked = client.get(f"/api/evidence-records/{evidence.json()['id']}")
         revealed = client.post(f"/api/evidence-records/{evidence.json()['id']}/reveal")
         access_events = client.get(f"/api/evidence-records/{evidence.json()['id']}/access-events")
+        messages = client.get(f"/api/runs/{run['id']}/agent-messages")
+        findings = client.get(f"/api/runs/{run['id']}/findings")
 
     assert evidence.status_code == 201
     assert finding.status_code == 201
@@ -216,6 +218,8 @@ def test_finding_reconstructs_run_provenance_and_keeps_sensitive_vm_evidence_mas
     assert masked.json()["vmResidentPath"] == "artifacts/memory.raw"
     assert revealed.json()["summary"] == raw_summary
     assert access_events.json() == [{"eventType": "evidence.revealed"}]
+    assert messages.json() == [{"sourceNodeId": "recon", "targetNodeId": None, "trigger": "evidence", "message": {"endpoint": "/admin"}}]
+    assert [item["id"] for item in findings.json()] == [finding.json()["id"]]
 
 
 def test_owner_cannot_save_a_branch_to_a_missing_workflow_node(tmp_path):

@@ -50,6 +50,45 @@ type AuditEvent = {
   crystalFlowId: string;
 };
 
+type NodeStatus = { nodeId: string; status: string };
+
+type AgentMessage = {
+  sourceNodeId: string;
+  targetNodeId: string | null;
+  trigger: string;
+  message: Record<string, unknown>;
+};
+
+type AiNodeInvocation = {
+  id: string;
+  nodeId: string;
+  status: string;
+  output: Record<string, unknown>;
+  timeoutSeconds: number;
+  resourceUnits: number;
+};
+
+type Finding = {
+  id: string;
+  title: string;
+  target: string;
+  provenance: {
+    nodeIds: string[];
+    agentMessages: AgentMessage[];
+    toolCalls: Array<{ id: string; status: string; stdout: string; stderr: string }>;
+    policyDecisions: Array<{ id: string; status: string; reason: string }>;
+    evidenceArtifacts: Array<{
+      id: string;
+      summary: string;
+      sha256: string;
+      storage: string;
+      vmResidentPath: string | null;
+      availability: string;
+      sensitive: boolean;
+    }>;
+  };
+};
+
 const palette: Array<{ kind: NodeKind; label: string }> = [
   { kind: "recon-agent", label: "Recon Agent" },
   { kind: "verification-step", label: "Verification Step" },
@@ -78,6 +117,17 @@ function toCanvasEdge(edge: CrystalFlow["edges"][number]): Edge {
   return { id: edge.id, source: edge.source, target: edge.target };
 }
 
+function InspectionList({ label, values }: { label: string; values: string[] }) {
+  return (
+    <section className="inspection-list" aria-label={label}>
+      <h4>{label}</h4>
+      {values.length === 0 ? <p className="muted">No records yet.</p> : (
+        <ul>{values.map((value, index) => <li key={`${label}-${index}`}>{value}</li>)}</ul>
+      )}
+    </section>
+  );
+}
+
 export function App() {
   const [flowName, setFlowName] = useState("");
   const [flow, setFlow] = useState<CrystalFlow | null>(null);
@@ -88,6 +138,12 @@ export function App() {
   const [reactFlow, setReactFlow] = useState<ReactFlowInstance<WorkflowNode, Edge> | null>(null);
   const [run, setRun] = useState<WorkflowRun | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
+  const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
+  const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
+  const [aiNodeInvocations, setAiNodeInvocations] = useState<AiNodeInvocation[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -97,6 +153,55 @@ export function App() {
   }, []);
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
+  const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null;
+  const selectedFinding = findings.find((finding) => finding.id === selectedFindingId) ?? null;
+  const statusByNode = new Map(nodeStatuses.map((nodeStatus) => [nodeStatus.nodeId, nodeStatus.status]));
+  const visualNodes = nodes.map((node) => ({
+    ...node,
+    className: statusByNode.has(node.id) ? `node-status-${statusByNode.get(node.id)}` : undefined,
+  }));
+  const visualEdges = edges.map((edge) => ({
+    ...edge,
+    animated: agentMessages.some((message) => (
+      message.sourceNodeId === edge.source && message.targetNodeId === edge.target
+    )),
+    className: selectedEdgeId === edge.id ? "edge-selected" : undefined,
+  }));
+  const selectedEdgeMessages = selectedEdge ? agentMessages.filter((message) => (
+    message.sourceNodeId === selectedEdge.source && message.targetNodeId === selectedEdge.target
+  )) : [];
+  const selectedNodeMessages = selectedNode ? agentMessages.filter((message) => (
+    message.sourceNodeId === selectedNode.id || message.targetNodeId === selectedNode.id
+  )) : [];
+  const selectedNodeInvocations = selectedNode ? aiNodeInvocations.filter((invocation) => (
+    invocation.nodeId === selectedNode.id
+  )) : [];
+
+  async function refreshRunDetails(runId: string) {
+    try {
+      const [nextAudit, nextStatuses, nextMessages, nextInvocations, nextFindings] = await Promise.all([
+        request<AuditEvent[]>(`/api/runs/${runId}/audit`),
+        request<NodeStatus[]>(`/api/runs/${runId}/node-statuses`),
+        request<AgentMessage[]>(`/api/runs/${runId}/agent-messages`),
+        request<AiNodeInvocation[]>(`/api/runs/${runId}/ai-node-invocations`),
+        request<Finding[]>(`/api/runs/${runId}/findings`),
+      ]);
+      setAudit(nextAudit);
+      setNodeStatuses(nextStatuses);
+      setAgentMessages(nextMessages);
+      setAiNodeInvocations(nextInvocations);
+      setFindings(nextFindings);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to refresh run details");
+    }
+  }
+
+  useEffect(() => {
+    if (!run) return undefined;
+    void refreshRunDetails(run.id);
+    const intervalId = window.setInterval(() => void refreshRunDetails(run.id), 2000);
+    return () => window.clearInterval(intervalId);
+  }, [run]);
 
   const onConnect: OnConnect = (connection: Connection) => {
     if (!connection.source || !connection.target || connection.source === connection.target) return;
@@ -163,6 +268,14 @@ export function App() {
     setNodes(selectedFlow.nodes.map(toCanvasNode));
     setEdges(selectedFlow.edges.map(toCanvasEdge));
     setSelectedNodeId(null);
+    setSelectedEdgeId(null);
+    setSelectedFindingId(null);
+    setRun(null);
+    setAudit([]);
+    setNodeStatuses([]);
+    setAgentMessages([]);
+    setAiNodeInvocations([]);
+    setFindings([]);
   }
 
   async function saveFlow() {
@@ -200,7 +313,7 @@ export function App() {
         method: "POST",
       });
       setRun(started);
-      setAudit(await request<AuditEvent[]>(`/api/runs/${started.id}/audit`));
+      await refreshRunDetails(started.id);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Unable to start run");
     }
@@ -274,24 +387,31 @@ export function App() {
             </aside>
             <div className="canvas" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
               <ReactFlow
-                edges={edges}
+                edges={visualEdges}
                 fitView
-                nodes={nodes}
+                nodes={visualNodes}
                 onConnect={onConnect}
+                onEdgeClick={(_, edge) => {
+                  setSelectedEdgeId(edge.id);
+                  setSelectedNodeId(null);
+                }}
                 onEdgesChange={(changes) => setEdges((current) => applyEdgeChanges(changes, current))}
                 onInit={setReactFlow}
-                onNodeClick={(_, node) => setSelectedNodeId(node.id)}
+                onNodeClick={(_, node) => {
+                  setSelectedNodeId(node.id);
+                  setSelectedEdgeId(null);
+                }}
                 onNodesChange={(changes) => setNodes((current) => applyNodeChanges(changes, current))}
               >
                 <Background />
                 <Controls />
               </ReactFlow>
             </div>
-            <aside aria-label="Node configuration" className="node-config">
-              <h3>Node configuration</h3>
+            <aside aria-label="Node and edge inspector" className="node-config">
+              <h3>Node &amp; edge inspector</h3>
               {selectedNode ? (
                 <>
-                  <p className="muted">{selectedNode.data.kind}</p>
+                  <p className="muted">{selectedNode.data.kind} · {statusByNode.get(selectedNode.id) ?? "not started"}</p>
                   <label htmlFor="node-label">Label</label>
                   <input
                     id="node-label"
@@ -304,18 +424,64 @@ export function App() {
                     onChange={(event) => updateSelectedNodeTarget(event.target.value)}
                     value={typeof selectedNode.data.config.target === "string" ? selectedNode.data.config.target : ""}
                   />
+                  <InspectionList label="Agent Messages" values={selectedNodeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
+                  <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
                 </>
-              ) : <p className="muted">Select a node to configure it.</p>}
+              ) : selectedEdge ? (
+                <>
+                  <p className="muted">{selectedEdge.source} → {selectedEdge.target}</p>
+                  <InspectionList label="Data transfer" values={selectedEdgeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
+                </>
+              ) : <p className="muted">Select a node or edge to inspect it.</p>}
             </aside>
           </div>
         </section>
       )}
 
       {run && (
-        <section className="panel" aria-labelledby="audit-title">
-          <h2 id="audit-title">Run audit</h2>
-          <p>Run {run.id} is {run.status}.</p>
-          <ul>{audit.map((event) => <li key={event.eventType}>{event.eventType}</li>)}</ul>
+        <section className="panel" aria-labelledby="execution-title">
+          <div className="canvas-heading">
+            <div>
+              <h2 id="execution-title">Live execution &amp; audit</h2>
+              <p>Run {run.id} is {run.status}. Status and data transfer refresh every two seconds.</p>
+            </div>
+            <button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh</button>
+          </div>
+          <div className="execution-grid">
+            <section>
+              <h3>Node status</h3>
+              {nodeStatuses.length === 0 ? <p className="muted">No Workflow Node activity yet.</p> : (
+                <ul className="status-list">{nodeStatuses.map((nodeStatus) => (
+                  <li key={nodeStatus.nodeId}><span>{nodeStatus.nodeId}</span><span className={`status-pill status-${nodeStatus.status}`}>{nodeStatus.status}</span></li>
+                ))}</ul>
+              )}
+              <h3>Execution Trail</h3>
+              <ul className="audit-list">{audit.map((event, index) => <li key={`${event.eventType}-${index}`}>{event.eventType}</li>)}</ul>
+            </section>
+            <section>
+              <h3>Findings</h3>
+              {findings.length === 0 ? <p className="muted">No Findings recorded for this run.</p> : (
+                <ul className="finding-list">{findings.map((finding) => (
+                  <li key={finding.id}>
+                    <button className={selectedFindingId === finding.id ? "finding-selected" : ""} onClick={() => setSelectedFindingId(finding.id)} type="button">
+                      {finding.title}
+                    </button>
+                  </li>
+                ))}</ul>
+              )}
+              {selectedFinding && (
+                <section className="finding-provenance" aria-label="Finding provenance">
+                  <h4>{selectedFinding.title}</h4>
+                  <p className="muted">{selectedFinding.target}</p>
+                  <InspectionList label="Supporting Workflow Nodes" values={selectedFinding.provenance.nodeIds} />
+                  <InspectionList label="Agent Messages" values={selectedFinding.provenance.agentMessages.map((message) => `${message.sourceNodeId} · ${message.trigger}: ${JSON.stringify(message.message)}`)} />
+                  <InspectionList label="Tool calls and logs" values={selectedFinding.provenance.toolCalls.map((toolCall) => `${toolCall.status}: ${toolCall.stdout || toolCall.stderr || "No output"}`)} />
+                  <InspectionList label="Policy outcomes and Approvals" values={selectedFinding.provenance.policyDecisions.map((decision) => `${decision.status}: ${decision.reason}`)} />
+                  <InspectionList label="Evidence artifacts" values={selectedFinding.provenance.evidenceArtifacts.map((artifact) => `${artifact.availability} · ${artifact.storage} · ${artifact.vmResidentPath ?? artifact.sha256}: ${artifact.summary}`)} />
+                </section>
+              )}
+            </section>
+          </div>
         </section>
       )}
 

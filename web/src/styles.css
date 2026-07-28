@@ -32,6 +32,27 @@ button { background: #71d8b2; border: 0; border-radius: 6px; color: #082016; cur
 .node-palette, .node-config { background: #0d1720; border: 1px solid #2a4658; border-radius: 8px; padding: 0.75rem; }
 .node-palette h3, .node-config h3 { font-size: 0.9rem; margin-bottom: 0.75rem; }
 .node-palette button { margin-bottom: 0.5rem; width: 100%; }
+.node-status-completed { border: 2px solid #71d8b2 !important; }
+.node-status-queued { border: 2px solid #f2cd6a !important; }
+.node-status-needs-human-review { border: 2px solid #ff9d9d !important; }
+.edge-selected { stroke: #f2cd6a !important; stroke-width: 3px !important; }
+
+.inspection-list { border-top: 1px solid #2a4658; margin-top: 1rem; padding-top: 0.75rem; }
+.inspection-list h4 { font-size: 0.8rem; margin: 0 0 0.4rem; }
+.inspection-list ul, .audit-list, .status-list, .finding-list { list-style: none; margin: 0; padding: 0; }
+.inspection-list li { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; overflow-wrap: anywhere; padding: 0.25rem 0; }
+
+.execution-grid { display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; margin-top: 1rem; }
+.execution-grid h3 { font-size: 0.95rem; }
+.status-list li { align-items: center; border-bottom: 1px solid #2a4658; display: flex; justify-content: space-between; padding: 0.5rem 0; }
+.status-pill { border-radius: 999px; font-size: 0.72rem; font-weight: 700; padding: 0.25rem 0.5rem; }
+.status-completed { background: #1e5948; color: #d8fff0; }
+.status-queued { background: #66551b; color: #fff3bc; }
+.status-needs-human-review { background: #6b3035; color: #ffe0e0; }
+.audit-list li { border-left: 2px solid #597589; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; margin: 0.4rem 0; padding-left: 0.6rem; }
+.finding-list button { background: #244657; color: #e7edf2; margin-bottom: 0.5rem; text-align: left; width: 100%; }
+.finding-list .finding-selected { background: #71d8b2; color: #082016; }
+.finding-provenance { background: #0d1720; border: 1px solid #2a4658; border-radius: 8px; margin-top: 0.75rem; padding: 0.75rem; }
 
 @media (max-width: 760px) {
   .canvas-heading, .workflow-editor { display: flex; flex-direction: column; }
@@ -39,4 +60,5 @@ button { background: #71d8b2; border: 0; border-radius: 6px; color: #082016; cur
   .node-palette { display: flex; flex-wrap: wrap; gap: 0.5rem; }
   .node-palette h3 { width: 100%; }
   .node-palette button { width: auto; }
+  .execution-grid { grid-template-columns: 1fr; }
 }

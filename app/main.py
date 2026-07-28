@@ -396,6 +396,13 @@ class NodeStatusResponse(BaseModel):
     status: str
 
 
+class AgentMessageResponse(BaseModel):
+    sourceNodeId: str
+    targetNodeId: str | None
+    trigger: str
+    message: dict[str, object]
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -1461,6 +1468,14 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Finding not found")
             return finding_response(connection, finding)
 
+    @app.get("/api/runs/{run_id}/findings", response_model=list[FindingResponse])
+    def list_run_findings(run_id: str) -> list[FindingResponse]:
+        with _connect(resolved_database_path) as connection:
+            findings = connection.execute(
+                "SELECT * FROM findings WHERE run_id = ? ORDER BY rowid", (run_id,)
+            ).fetchall()
+            return [finding_response(connection, finding) for finding in findings]
+
     @app.post("/api/vm-tasks", response_model=RunLogBundleResponse, status_code=status.HTTP_201_CREATED)
     def run_vm_task(request: CreateVmTaskRequest) -> RunLogBundleResponse:
         with _connect(resolved_database_path) as connection:
@@ -1693,6 +1708,28 @@ def create_app(
         with _connect(resolved_database_path) as connection:
             rows = connection.execute("SELECT node_id, status FROM node_statuses WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()
         return [NodeStatusResponse(nodeId=row["node_id"], status=row["status"]) for row in rows]
+
+    @app.get("/api/runs/{run_id}/agent-messages", response_model=list[AgentMessageResponse])
+    def list_agent_messages(run_id: str) -> list[AgentMessageResponse]:
+        with _connect(resolved_database_path) as connection:
+            messages = connection.execute(
+                """
+                SELECT source_node_id, target_node_id, trigger, message_json
+                FROM agent_messages
+                WHERE run_id = ?
+                ORDER BY rowid
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            AgentMessageResponse(
+                sourceNodeId=message["source_node_id"],
+                targetNodeId=message["target_node_id"],
+                trigger=message["trigger"],
+                message=json.loads(message["message_json"]),
+            )
+            for message in messages
+        ]
 
     @app.post(
         "/api/crystal-flows/{crystal_flow_id}/runs",
