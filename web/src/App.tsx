@@ -16,6 +16,7 @@ import {
   ReactFlow,
   ReactFlowInstance,
 } from "@xyflow/react";
+import { Link, NavLink, useLocation, useNavigate } from "react-router-dom";
 import "@xyflow/react/dist/style.css";
 
 type NodeKind = "recon-agent" | "verification-step" | "approval-gate" | "custom-agent";
@@ -135,6 +136,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     throw new Error(`Request failed with ${response.status}`);
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return response.json() as Promise<T>;
 }
 
@@ -162,7 +166,62 @@ function InspectionList({ label, values }: { label: string; values: string[] }) 
   );
 }
 
+function keepValidBranches(workflowNodes: WorkflowNode[], workflowEdges: Edge[]): WorkflowNode[] {
+  const validRoutes = new Set(workflowEdges.map((edge) => `${edge.source}\0${edge.target}`));
+  return workflowNodes.map((node) => {
+    const configuredBranches = node.data.config.branches;
+    if (
+      !configuredBranches
+      || typeof configuredBranches !== "object"
+      || Array.isArray(configuredBranches)
+    ) {
+      return node;
+    }
+
+    const branches = Object.fromEntries(
+      Object.entries(configuredBranches).filter(([, target]) => (
+        typeof target === "string" && validRoutes.has(`${node.id}\0${target}`)
+      )),
+    );
+    const boundedLoop = node.data.config.boundedLoop;
+    const boundedLoopConfig = (
+      boundedLoop
+      && typeof boundedLoop === "object"
+      && !Array.isArray(boundedLoop)
+    ) ? boundedLoop as Record<string, unknown> : null;
+    const boundedLoopTrigger = (
+      boundedLoopConfig && typeof boundedLoopConfig.trigger === "string"
+    ) ? boundedLoopConfig.trigger : null;
+    const nextConfig: Record<string, unknown> = { ...node.data.config, branches };
+    if (boundedLoopTrigger && !(boundedLoopTrigger in branches)) {
+      delete nextConfig.boundedLoop;
+    }
+    return { ...node, data: { ...node.data, config: nextConfig } };
+  });
+}
+
 export function App() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const page = location.pathname.startsWith("/runs")
+    ? "runs"
+    : location.pathname.startsWith("/findings")
+      ? "findings"
+      : location.pathname.startsWith("/policy")
+        ? "policy"
+        : "workflows";
+  const routeFlowId = page === "workflows"
+    ? location.pathname.match(/^\/workflows\/([^/]+)$/)?.[1] ?? null
+    : null;
+  const pageTitle = {
+    workflows: "Workflow Studio",
+    runs: "Run History",
+    findings: "Findings",
+    policy: "Policy & Scope",
+  }[page];
+  const [theme, setTheme] = useState<"dark" | "light">(() => (
+    localStorage.getItem("crystal-flow-theme") === "light" ? "light" : "dark"
+  ));
   const [flowName, setFlowName] = useState("");
   const [flow, setFlow] = useState<CrystalFlow | null>(null);
   const [savedFlows, setSavedFlows] = useState<CrystalFlow[]>([]);
@@ -185,6 +244,21 @@ export function App() {
       .then(setSavedFlows)
       .catch(() => setError("Unable to load saved Crystal Flows"));
   }, []);
+
+  useEffect(() => {
+    if (!routeFlowId || flow?.id === routeFlowId) return;
+    request<CrystalFlow>(`/api/crystal-flows/${routeFlowId}`)
+      .then((selectedFlow) => openFlow(selectedFlow, false))
+      .catch(() => {
+        setError("Unable to open the requested Crystal Flow");
+        navigate("/workflows", { replace: true });
+      });
+  }, [routeFlowId]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("crystal-flow-theme", theme);
+  }, [theme]);
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null;
@@ -279,6 +353,15 @@ export function App() {
     )));
   }
 
+  function updateSelectedNodeSshTarget(sshTarget: string) {
+    if (!selectedNode) return;
+    setNodes((currentNodes) => currentNodes.map((node) => (
+      node.id === selectedNode.id
+        ? { ...node, data: { ...node.data, config: { ...node.data.config, sshTarget } } }
+        : node
+    )));
+  }
+
   async function createFlow(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
@@ -312,7 +395,7 @@ export function App() {
     }
   }
 
-  function openFlow(selectedFlow: CrystalFlow) {
+  function openFlow(selectedFlow: CrystalFlow, updatePath = true) {
     setFlow(selectedFlow);
     setNodes(selectedFlow.nodes.map(toCanvasNode));
     setEdges(selectedFlow.edges.map(toCanvasEdge));
@@ -325,6 +408,9 @@ export function App() {
     setAgentMessages([]);
     setAiNodeInvocations([]);
     setFindings([]);
+    if (updatePath) {
+      navigate(`/workflows/${selectedFlow.id}`);
+    }
   }
 
   async function saveFlow() {
@@ -354,6 +440,69 @@ export function App() {
     }
   }
 
+  async function deleteFlow() {
+    if (!flow || !window.confirm(`Delete "${flow.name}" and all of its run records? This cannot be undone.`)) {
+      return;
+    }
+    setError(null);
+    try {
+      await request<void>(`/api/crystal-flows/${flow.id}`, { method: "DELETE" });
+      setSavedFlows((flows) => flows.filter((savedFlow) => savedFlow.id !== flow.id));
+      setFlow(null);
+      setNodes([]);
+      setEdges([]);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setSelectedFindingId(null);
+      setRun(null);
+      setAudit([]);
+      setNodeStatuses([]);
+      setAgentMessages([]);
+      setAiNodeInvocations([]);
+      setFindings([]);
+      navigate("/workflows");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to delete Crystal Flow");
+    }
+  }
+
+  function deleteSelectedItem() {
+    if (selectedNode) {
+      const nextEdges = edges.filter((edge) => (
+        edge.source !== selectedNode.id && edge.target !== selectedNode.id
+      ));
+      const nextNodes = nodes.filter((node) => node.id !== selectedNode.id);
+      setEdges(nextEdges);
+      setNodes(keepValidBranches(nextNodes, nextEdges));
+      setSelectedNodeId(null);
+      return;
+    }
+    if (selectedEdge) {
+      const nextEdges = edges.filter((edge) => edge.id !== selectedEdge.id);
+      setEdges(nextEdges);
+      setNodes((currentNodes) => keepValidBranches(currentNodes, nextEdges));
+      setSelectedEdgeId(null);
+    }
+  }
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      const target = event.target;
+      if (
+        (event.key !== "Delete" && event.key !== "Backspace")
+        || target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || !(selectedNodeId || selectedEdgeId)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      deleteSelectedItem();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedNodeId, selectedEdgeId, nodes, edges]);
+
   async function startRun() {
     if (!flow) return;
     setError(null);
@@ -377,10 +526,10 @@ export function App() {
         </div>
 
         <nav className="primary-nav" aria-label="Primary navigation">
-          <button className="nav-item is-active" type="button"><span className="nav-icon">⌘</span>Workflow Studio</button>
-          <button className="nav-item" type="button"><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></button>
-          <button className="nav-item" type="button"><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></button>
-          <button className="nav-item" type="button"><span className="nav-icon">✓</span>Policy &amp; Scope</button>
+          <NavLink className={({ isActive }) => `nav-item ${isActive || (page === "workflows" && location.pathname === "/") ? "is-active" : ""}`} to="/workflows"><span className="nav-icon">⌘</span>Workflow Studio</NavLink>
+          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/runs"><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></NavLink>
+          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/findings"><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></NavLink>
+          <NavLink className={({ isActive }) => `nav-item ${isActive ? "is-active" : ""}`} to="/policy"><span className="nav-icon">✓</span>Policy &amp; Scope</NavLink>
         </nav>
 
         <div className="sidebar-section">
@@ -398,15 +547,15 @@ export function App() {
           </form>
           <div className="flow-list">
             {savedFlows.map((savedFlow) => (
-              <button
+              <Link
                 className={`flow-list-item ${flow?.id === savedFlow.id ? "is-current" : ""}`}
                 key={savedFlow.id}
-                onClick={() => openFlow(savedFlow)}
-                type="button"
+                onClick={() => openFlow(savedFlow, false)}
+                to={`/workflows/${savedFlow.id}`}
               >
                 <span className="flow-indicator" />
                 <span><strong>{savedFlow.name}</strong><small>Version {savedFlow.version}</small></span>
-              </button>
+              </Link>
             ))}
           </div>
         </div>
@@ -420,19 +569,54 @@ export function App() {
       <section className="main-workspace">
         <header className="topbar">
           <div>
-            <div className="breadcrumbs"><span>Workspace</span><b>/</b><span>{flow?.name ?? "Overview"}</span></div>
-            <h1>{flow?.name ?? "Workflow Studio"}</h1>
+            <div className="breadcrumbs"><span>Workspace</span><b>/</b><span>{page === "workflows" ? flow?.name ?? "Overview" : pageTitle}</span></div>
+            <h1>{page === "workflows" ? flow?.name ?? pageTitle : pageTitle}</h1>
           </div>
           <div className="topbar-actions">
             <div className="environment-pill"><span className="pulse-dot" />Authorized lab</div>
-            {flow && <button className="button secondary" onClick={saveFlow} type="button">Save version</button>}
-            {flow && <button className="button primary" onClick={startRun} type="button"><span>▶</span>{run ? "Start new run" : "Start run"}</button>}
+            <button
+              aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              className="theme-toggle"
+              onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              type="button"
+            >
+              <span>{theme === "dark" ? "☀" : "☾"}</span>
+              <span>{theme === "dark" ? "Light" : "Dark"}</span>
+            </button>
+            {page === "workflows" && flow && <button className="button danger" onClick={() => void deleteFlow()} type="button">Delete flow</button>}
+            {page === "workflows" && flow && <button className="button secondary" onClick={saveFlow} type="button">Save version</button>}
+            {page === "workflows" && flow && <button className="button primary" onClick={startRun} type="button"><span>▶</span>{run ? "Start new run" : "Start run"}</button>}
           </div>
         </header>
 
         {error && <div className="error-toast" role="alert"><strong>Action failed</strong><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
 
-        {!flow ? (
+        {page === "runs" ? (
+          <main className="section-page">
+            <div className="page-intro"><span>EXECUTION OPERATIONS</span><h2>Run History</h2><p>Review the current execution state and its auditable events. Run data remains attached to its originating Crystal Flow.</p></div>
+            <div className="page-card">
+              <div className="page-card-heading"><span>RECENT RUN</span><b>{run ? "1 RECORD" : "NO RECORDS"}</b></div>
+              {run ? <div className="run-record"><span className="pulse-dot" /><span><strong>{run.id}</strong><small>Flow {run.crystalFlowId}</small></span><span className={`status-pill status-${run.status}`}>{run.status}</span></div> : <p className="page-empty">Start a Workflow from the Studio to create an execution record.</p>}
+            </div>
+          </main>
+        ) : page === "findings" ? (
+          <main className="section-page">
+            <div className="page-intro"><span>EVIDENCE &amp; PROVENANCE</span><h2>Findings</h2><p>Inspect findings generated by the active run, including supporting nodes, policy outcomes, tool logs, and evidence artifacts.</p></div>
+            <div className="page-card">
+              <div className="page-card-heading"><span>ACTIVE FINDINGS</span><b>{findings.length} RECORDS</b></div>
+              {findings.length === 0 ? <p className="page-empty">No Findings have been recorded in the current session.</p> : <ul className="page-finding-list">{findings.map((finding) => <li key={finding.id}><strong>{finding.title}</strong><span>{finding.target}</span><small>{finding.provenance.evidenceArtifacts.length} evidence artifacts</small></li>)}</ul>}
+            </div>
+          </main>
+        ) : page === "policy" ? (
+          <main className="section-page">
+            <div className="page-intro"><span>GOVERNANCE CONTROL PLANE</span><h2>Policy &amp; Scope</h2><p>Execution remains bounded by declared targets, workspaces, permissions, resource limits, and approved VM environments.</p></div>
+            <div className="policy-grid">
+              <section className="page-card"><div className="page-card-heading"><span>SSH EXECUTION</span><b>HOST MANAGED</b></div><h3>Kali VM alias</h3><code>export KALI_SSH_TARGET=codex-kali</code><p>The platform resolves Kali tasks through this host-approved SSH alias. A node’s SSH field records the intended destination but cannot authorize a new host.</p></section>
+              <section className="page-card"><div className="page-card-heading"><span>ENFORCEMENT</span><b>ALWAYS ON</b></div><ul className="control-list"><li>Scope and target validation</li><li>Workspace isolation</li><li>Policy and approval checks</li><li>Rate limits and budgets</li><li>Complete audit recording</li></ul></section>
+            </div>
+          </main>
+        ) : !flow ? (
           <main className="empty-workspace">
             <section className="welcome-card">
               <div className="welcome-kicker">ADAPTIVE SECURITY ORCHESTRATION</div>
@@ -507,12 +691,20 @@ export function App() {
                     <input id="node-label" onChange={(event) => updateSelectedNodeLabel(event.target.value)} value={selectedNode.data.label} />
                     <label htmlFor="node-target">Target or task detail</label>
                     <input id="node-target" onChange={(event) => updateSelectedNodeTarget(event.target.value)} placeholder="Declared task target" value={typeof selectedNode.data.config.target === "string" ? selectedNode.data.config.target : ""} />
+                    <label htmlFor="node-ssh-target">SSH execution alias</label>
+                    <input id="node-ssh-target" onChange={(event) => updateSelectedNodeSshTarget(event.target.value)} placeholder="codex-kali" value={typeof selectedNode.data.config.sshTarget === "string" ? selectedNode.data.config.sshTarget : ""} />
+                    <p className="field-help">
+                      {typeof selectedNode.data.config.sshTarget === "string" && selectedNode.data.config.sshTarget
+                        ? <>Resolved command: <code>ssh {selectedNode.data.config.sshTarget}</code></>
+                        : <>Example: <code>ssh codex-kali</code>. The host alias must also be approved in the execution environment.</>}
+                    </p>
                     <div className="config-summary"><span><small>Status</small><strong>{statusByNode.get(selectedNode.id) ?? "Not started"}</strong></span><span><small>Messages</small><strong>{selectedNodeMessages.length}</strong></span><span><small>AI calls</small><strong>{selectedNodeInvocations.length}</strong></span></div>
                     <InspectionList label="Agent Messages" values={selectedNodeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
                     <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
+                    <button className="delete-item-button" onClick={deleteSelectedItem} type="button">Delete node and connections</button>
                   </div>
                 ) : selectedEdge ? (
-                  <div className="inspector-content"><div className="edge-route"><span>{selectedEdge.source}</span><b>→</b><span>{selectedEdge.target}</span></div><InspectionList label="Data transfer" values={selectedEdgeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} /></div>
+                  <div className="inspector-content"><div className="edge-route"><span>{selectedEdge.source}</span><b>→</b><span>{selectedEdge.target}</span></div><InspectionList label="Data transfer" values={selectedEdgeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} /><button className="delete-item-button" onClick={deleteSelectedItem} type="button">Delete connection</button></div>
                 ) : (
                   <div className="inspector-empty"><span>⌖</span><strong>Nothing selected</strong><p>Select a node or branch to inspect its configuration, messages, and execution history.</p></div>
                 )}

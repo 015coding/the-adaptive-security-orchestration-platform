@@ -11,9 +11,10 @@
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "@xyflow/react": "latest",
-    "vite": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "react-router-dom": "^7.18.1",
+    "vite": "latest"
   },
   "devDependencies": {
     "@types/react": "latest",

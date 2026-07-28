@@ -25,9 +25,15 @@ Open the URL printed by Vite. The UI creates a Crystal Flow, edits its Workflow 
 Set the SSH targets for the dedicated, restricted VM accounts before starting the API:
 
 ```sh
-export KALI_SSH_TARGET=assessment-runner@kali-vm
-export DEBIAN_SSH_TARGET=assessment-runner@debian-vm
+# Values may be normal SSH config aliases:
+export KALI_SSH_TARGET=codex-kali
+export DEBIAN_SSH_TARGET=codex-debian
 ```
+
+For example, `KALI_SSH_TARGET=codex-kali` makes the host runner connect with
+`ssh codex-kali '<scope-derived workspace command>'`. Configure `codex-kali` in
+the Owner host's `~/.ssh/config` and verify `ssh codex-kali` works before
+starting a run.
 
 The remote `assessment-runner` account must be restricted by the VM configuration to its assigned Run Workspace and approved network targets. The host API passes only the Scope-derived workspace and timeout to SSH; it does not grant the Owner host filesystem to VM tasks.
 

@@ -1221,6 +1221,104 @@ def create_app(
             for flow in flows
         ]
 
+    @app.delete(
+        "/api/crystal-flows/{crystal_flow_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    def delete_crystal_flow(crystal_flow_id: str) -> None:
+        with _connect(resolved_database_path) as connection:
+            flow = connection.execute(
+                "SELECT 1 FROM crystal_flows WHERE id = ?", (crystal_flow_id,)
+            ).fetchone()
+            if flow is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Crystal Flow not found",
+                )
+
+            run_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM workflow_runs WHERE crystal_flow_id = ?",
+                    (crystal_flow_id,),
+                ).fetchall()
+            ]
+            if run_ids:
+                run_placeholders = ",".join("?" for _ in run_ids)
+                finding_ids = [
+                    row["id"]
+                    for row in connection.execute(
+                        f"SELECT id FROM findings WHERE run_id IN ({run_placeholders})",
+                        run_ids,
+                    ).fetchall()
+                ]
+                evidence_ids = [
+                    row["id"]
+                    for row in connection.execute(
+                        f"SELECT id FROM evidence_records WHERE run_id IN ({run_placeholders})",
+                        run_ids,
+                    ).fetchall()
+                ]
+
+                if finding_ids:
+                    finding_placeholders = ",".join("?" for _ in finding_ids)
+                    connection.execute(
+                        f"DELETE FROM finding_evidence_records WHERE finding_id IN ({finding_placeholders})",
+                        finding_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM finding_run_log_bundles WHERE finding_id IN ({finding_placeholders})",
+                        finding_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM finding_policy_decisions WHERE finding_id IN ({finding_placeholders})",
+                        finding_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM findings WHERE id IN ({finding_placeholders})",
+                        finding_ids,
+                    )
+                if evidence_ids:
+                    evidence_placeholders = ",".join("?" for _ in evidence_ids)
+                    connection.execute(
+                        f"DELETE FROM evidence_access_events WHERE evidence_record_id IN ({evidence_placeholders})",
+                        evidence_ids,
+                    )
+                    connection.execute(
+                        f"DELETE FROM evidence_records WHERE id IN ({evidence_placeholders})",
+                        evidence_ids,
+                    )
+
+                for table in ("ai_node_invocations", "agent_messages", "node_statuses"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE run_id IN ({run_placeholders})",
+                        run_ids,
+                    )
+                connection.execute(
+                    f"DELETE FROM execution_trail_events WHERE run_id IN ({run_placeholders})",
+                    run_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM workflow_runs WHERE id IN ({run_placeholders})",
+                    run_ids,
+                )
+
+            connection.execute(
+                "DELETE FROM benchmark_flows WHERE crystal_flow_id = ?",
+                (crystal_flow_id,),
+            )
+            connection.execute(
+                "DELETE FROM crystal_flow_plugins WHERE crystal_flow_id = ?",
+                (crystal_flow_id,),
+            )
+            connection.execute(
+                "DELETE FROM crystal_flow_versions WHERE crystal_flow_id = ?",
+                (crystal_flow_id,),
+            )
+            connection.execute(
+                "DELETE FROM crystal_flows WHERE id = ?", (crystal_flow_id,)
+            )
+
     @app.put("/api/crystal-flows/{crystal_flow_id}", response_model=CrystalFlowResponse)
     def save_crystal_flow(
         crystal_flow_id: str, request: SaveCrystalFlowRequest

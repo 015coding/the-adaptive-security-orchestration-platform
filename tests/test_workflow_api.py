@@ -130,6 +130,41 @@ def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
     assert original.json()["edges"] == []
 
 
+def test_owner_can_delete_a_crystal_flow_and_its_run_records(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        flow = client.post(
+            "/api/crystal-flows", json={"name": "Disposable assessment"}
+        ).json()
+        client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [
+                    {
+                        "id": "recon",
+                        "type": "recon-agent",
+                        "label": "Recon",
+                        "position": {"x": 0, "y": 0},
+                        "config": {},
+                    }
+                ],
+                "edges": [],
+            },
+        )
+        client.post(f"/api/crystal-flows/{flow['id']}/runs")
+
+        deleted = client.delete(f"/api/crystal-flows/{flow['id']}")
+
+        assert deleted.status_code == 204
+        assert client.get(f"/api/crystal-flows/{flow['id']}").status_code == 404
+        assert client.get(
+            f"/api/crystal-flows/{flow['id']}/versions/1"
+        ).status_code == 404
+        assert client.get("/api/crystal-flows").json() == []
+        assert client.delete(f"/api/crystal-flows/{flow['id']}").status_code == 404
+
+
 def test_finding_reconstructs_run_provenance_and_keeps_sensitive_vm_evidence_masked(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
     raw_summary = "token=super-secret"
