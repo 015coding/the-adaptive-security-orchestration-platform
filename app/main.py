@@ -80,6 +80,30 @@ class SaveCrystalFlowRequest(BaseModel):
                 raise ValueError("Workflow Edges must connect existing Workflow Nodes")
             if edge.source == edge.target:
                 raise ValueError("Workflow Edges cannot connect a node to itself")
+        declared_edges = {(edge.source, edge.target) for edge in self.edges}
+        for node in self.nodes:
+            branches = node.config.get("branches", {})
+            if not isinstance(branches, dict) or any(
+                not isinstance(trigger, str) or not trigger or not isinstance(target, str) or not target
+                for trigger, target in branches.items()
+            ):
+                raise ValueError("Workflow Node branches must map non-empty triggers to Node IDs")
+            if any((node.id, target) not in declared_edges for target in branches.values()):
+                raise ValueError("Workflow Node branches must use declared Workflow Edges")
+            bounded_loop = node.config.get("boundedLoop")
+            if bounded_loop is not None:
+                if not isinstance(bounded_loop, dict):
+                    raise ValueError("Bounded Loop configuration must be an object")
+                trigger = bounded_loop.get("trigger")
+                max_attempts = bounded_loop.get("maxAttempts")
+                if (
+                    not isinstance(trigger, str)
+                    or not trigger
+                    or trigger not in branches
+                    or type(max_attempts) is not int
+                    or max_attempts < 1
+                ):
+                    raise ValueError("Bounded Loop requires a declared trigger and maxAttempts of at least 1")
         return self
 
 
@@ -197,6 +221,11 @@ class NodeResultResponse(BaseModel):
     message: dict[str, object]
 
 
+class NodeStatusResponse(BaseModel):
+    nodeId: str
+    status: str
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -285,6 +314,13 @@ def _initialize_database(database_path: Path) -> None:
                 target_node_id TEXT,
                 trigger TEXT NOT NULL,
                 message_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS node_statuses (
+                run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (run_id, node_id)
             );
 
             INSERT OR IGNORE INTO crystal_flow_versions (
@@ -727,6 +763,16 @@ def create_app(
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Workflow Node is not in this Crystal Flow")
             branches = source.get("config", {}).get("branches", {})
             next_node_id = branches.get(request.trigger) if isinstance(branches, dict) else None
+            node_status = "completed"
+            bounded_loop = source.get("config", {}).get("boundedLoop", {})
+            if isinstance(bounded_loop, dict) and bounded_loop.get("trigger") == request.trigger:
+                attempts = connection.execute(
+                    "SELECT COUNT(*) AS count FROM agent_messages WHERE run_id = ? AND source_node_id = ? AND trigger = ?",
+                    (run_id, request.nodeId, request.trigger),
+                ).fetchone()["count"]
+                if attempts >= bounded_loop.get("maxAttempts", 0):
+                    next_node_id = None
+                    node_status = "needs-human-review"
             valid_edges = {(edge["source"], edge["target"]) for edge in flow.edges}
             if next_node_id is not None and (request.nodeId, next_node_id) not in valid_edges:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Branch is not declared by a Workflow Edge")
@@ -736,9 +782,24 @@ def create_app(
             )
             connection.execute(
                 "INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id) VALUES (?, ?, ?)",
-                ("node.completed", run_id, run["crystal_flow_id"]),
+                (f"node.{node_status}", run_id, run["crystal_flow_id"]),
             )
-        return NodeResultResponse(nodeStatus="completed", nextNodeId=next_node_id, message=request.result)
+            connection.execute(
+                "INSERT OR REPLACE INTO node_statuses (run_id, node_id, status) VALUES (?, ?, ?)",
+                (run_id, request.nodeId, node_status),
+            )
+            if next_node_id is not None:
+                connection.execute(
+                    "INSERT OR REPLACE INTO node_statuses (run_id, node_id, status) VALUES (?, ?, ?)",
+                    (run_id, next_node_id, "queued"),
+                )
+        return NodeResultResponse(nodeStatus=node_status, nextNodeId=next_node_id, message=request.result)
+
+    @app.get("/api/runs/{run_id}/node-statuses", response_model=list[NodeStatusResponse])
+    def list_node_statuses(run_id: str) -> list[NodeStatusResponse]:
+        with _connect(resolved_database_path) as connection:
+            rows = connection.execute("SELECT node_id, status FROM node_statuses WHERE run_id = ? ORDER BY rowid", (run_id,)).fetchall()
+        return [NodeStatusResponse(nodeId=row["node_id"], status=row["status"]) for row in rows]
 
     @app.post(
         "/api/crystal-flows/{crystal_flow_id}/runs",

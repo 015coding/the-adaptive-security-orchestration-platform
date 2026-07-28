@@ -378,6 +378,67 @@ def test_run_routes_a_structured_agent_message_only_to_a_declared_branch(tmp_pat
     assert routed.json()["message"] == {"api": "/openapi.json"}
 
 
+def test_bounded_loop_stops_after_its_declared_retry_limit(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Bounded flow"}).json()
+        client.put(f"/api/crystal-flows/{flow['id']}", json={
+            "nodes": [
+                {"id": "recon", "type": "recon-agent", "label": "Recon", "position": {"x": 0, "y": 0}, "config": {"branches": {"timeout": "retry"}, "boundedLoop": {"trigger": "timeout", "maxAttempts": 1}}},
+                {"id": "retry", "type": "verification-step", "label": "Retry", "position": {"x": 200, "y": 0}, "config": {}},
+            ],
+            "edges": [{"id": "recon-retry", "source": "recon", "target": "retry"}],
+        })
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        first = client.post(f"/api/runs/{run['id']}/node-results", json={"nodeId": "recon", "trigger": "timeout", "result": {}})
+        second = client.post(f"/api/runs/{run['id']}/node-results", json={"nodeId": "recon", "trigger": "timeout", "result": {}})
+        node_statuses = client.get(f"/api/runs/{run['id']}/node-statuses")
+
+    assert first.json()["nodeStatus"] == "completed"
+    assert first.json()["nextNodeId"] == "retry"
+    assert second.json()["nodeStatus"] == "needs-human-review"
+    assert second.json()["nextNodeId"] is None
+    assert node_statuses.status_code == 200
+    assert {item["nodeId"]: item["status"] for item in node_statuses.json()} == {
+        "recon": "needs-human-review",
+        "retry": "queued",
+    }
+
+
+def test_crystal_flow_rejects_an_invalid_bounded_loop_configuration(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Invalid bounded flow"}).json()
+        response = client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [
+                    {
+                        "id": "recon",
+                        "type": "recon-agent",
+                        "label": "Recon",
+                        "position": {"x": 0, "y": 0},
+                        "config": {
+                            "branches": {"timeout": "retry"},
+                            "boundedLoop": {"trigger": "timeout", "maxAttempts": 0},
+                        },
+                    },
+                    {
+                        "id": "retry",
+                        "type": "verification-step",
+                        "label": "Retry",
+                        "position": {"x": 200, "y": 0},
+                        "config": {},
+                    },
+                ],
+                "edges": [{"id": "recon-retry", "source": "recon", "target": "retry"}],
+            },
+    )
+
+    assert response.status_code == 422
+    assert "maxAttempts" in response.text
+
+
 def test_owner_cannot_create_a_crystal_flow_with_a_whitespace_only_name(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 
