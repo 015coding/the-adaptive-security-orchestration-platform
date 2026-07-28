@@ -19,6 +19,18 @@ class ControlledVmRunner:
     def configured_targets(self) -> dict[str, str]:
         return dict(self.environments)
 
+    def prepare_workspace(
+        self, *, environment: str, workspace: str, timeout_seconds: int = 30
+    ) -> None:
+        self.calls.append(
+            {
+                "environment": environment,
+                "workspace": workspace,
+                "command": ["mkdir", "-p", workspace],
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+
     def execute(
         self, *, environment: str, workspace: str, command: list[str], timeout_seconds: int
     ) -> VmCommandResult:
@@ -519,11 +531,26 @@ def test_owner_can_configure_and_audit_an_ssh_execution_environment(tmp_path):
         }
         assert runner.environments == {"kali": "codex-kali"}
         assert client.get("/api/execution-environments").json() == [configured.json()]
+        prepared = client.post(
+            "/api/execution-environments/kali/workspaces",
+            json={"workspace": "/srv/crystal-flow/ctf-01"},
+        )
+        assert prepared.status_code == 201
+        assert prepared.json() == {
+            "environment": "kali",
+            "workspace": "/srv/crystal-flow/ctf-01",
+            "status": "ready",
+        }
+        assert runner.calls[-1]["command"] == [
+            "mkdir",
+            "-p",
+            "/srv/crystal-flow/ctf-01",
+        ]
         audit_event = client.get("/api/configuration-audit").json()[0]
         assert audit_event == {
-            "eventType": "execution-environment.configured",
+            "eventType": "execution-workspace.prepared",
             "subject": "kali",
-            "detail": {"sshTarget": "codex-kali"},
+            "detail": {"workspace": "/srv/crystal-flow/ctf-01"},
             "createdAt": audit_event["createdAt"],
         }
 

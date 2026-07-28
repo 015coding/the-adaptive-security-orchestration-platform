@@ -239,6 +239,11 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sshTarget }),
       });
+      await request<{ status: string }>(`/api/execution-environments/${environment}/workspaces`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspace }),
+      });
       const allowedActions = ["reconnaissance", "verification"];
       if (includeExploitation) allowedActions.push("exploitation-attempt");
       const scope = await request<ScopeResponse>("/api/scopes", {
@@ -335,7 +340,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
             <label><span>SSH alias</span><input required value={sshTarget} onChange={(event) => setSshTarget(event.target.value)} /></label>
             <label className="wide"><span>VM Workspace</span><input required value={workspace} onChange={(event) => setWorkspace(event.target.value)} /></label>
           </div>
-          <p className="form-note">The SSH alias is saved to the Backend and takes effect immediately. The Workspace must already exist inside the selected VM.</p>
+          <p className="form-note">The SSH alias is saved to the Backend and takes effect immediately. The Workspace is created automatically through the approved SSH connection.</p>
         </section>
         <section className="page-card">
           <div className="page-card-heading"><span>SCOPE WINDOW &amp; LIMITS</span><b>03</b></div>

@@ -267,6 +267,24 @@ class ExecutionEnvironmentResponse(BaseModel):
     sshTarget: str
 
 
+class PrepareWorkspaceRequest(BaseModel):
+    workspace: str = Field(min_length=2, max_length=1024)
+
+    @field_validator("workspace")
+    @classmethod
+    def workspace_must_be_an_absolute_bounded_path(cls, value: str) -> str:
+        workspace = Path(value)
+        if not workspace.is_absolute() or ".." in workspace.parts or value == "/":
+            raise ValueError("workspace must be an absolute, non-root path without traversal")
+        return value
+
+
+class PrepareWorkspaceResponse(BaseModel):
+    environment: Literal["kali", "debian"]
+    workspace: str
+    status: str
+
+
 class ConfigurationAuditEventResponse(BaseModel):
     eventType: str
     subject: str
@@ -1241,6 +1259,49 @@ def create_app(
         return ExecutionEnvironmentResponse(
             environment=environment,
             sshTarget=request.sshTarget,
+        )
+
+    @app.post(
+        "/api/execution-environments/{environment}/workspaces",
+        response_model=PrepareWorkspaceResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def prepare_execution_workspace(
+        environment: Literal["kali", "debian"],
+        request: PrepareWorkspaceRequest,
+    ) -> PrepareWorkspaceResponse:
+        prepare_workspace = getattr(configured_vm_runner, "prepare_workspace", None)
+        if not callable(prepare_workspace):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Execution environment cannot prepare a Workspace",
+            )
+        try:
+            prepare_workspace(environment=environment, workspace=request.workspace)
+        except VmRunnerError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=str(error),
+            ) from error
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO configuration_audit_events (
+                    id, event_type, subject, detail_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    "execution-workspace.prepared",
+                    environment,
+                    json.dumps({"workspace": request.workspace}),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        return PrepareWorkspaceResponse(
+            environment=environment,
+            workspace=request.workspace,
+            status="ready",
         )
 
     @app.get(

@@ -38,6 +38,25 @@ class SshVmRunner:
     def configured_targets(self) -> dict[str, str]:
         return dict(self._environments)
 
+    def prepare_workspace(
+        self, *, environment: str, workspace: str, timeout_seconds: int = 30
+    ) -> None:
+        ssh_target = self._environments.get(environment)
+        if not ssh_target:
+            raise VmRunnerError(f"{environment} execution environment is not configured")
+        try:
+            result = subprocess.run(
+                ["ssh", ssh_target, "mkdir -p -- " + shlex.quote(workspace)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise VmRunnerError("VM Workspace preparation timed out") from error
+        if result.returncode != 0:
+            raise VmRunnerError(result.stderr.strip() or "unable to prepare VM Workspace")
+
     def execute(
         self, *, environment: str, workspace: str, command: list[str], timeout_seconds: int
     ) -> VmCommandResult:
