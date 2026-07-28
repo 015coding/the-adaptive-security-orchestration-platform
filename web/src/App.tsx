@@ -7,8 +7,12 @@ import {
   Connection,
   Controls,
   Edge,
+  Handle,
+  MiniMap,
   Node,
+  NodeProps,
   OnConnect,
+  Position,
   ReactFlow,
   ReactFlowInstance,
 } from "@xyflow/react";
@@ -20,6 +24,7 @@ type WorkflowNodeData = {
   kind: NodeKind;
   label: string;
   config: Record<string, unknown>;
+  status?: string;
 };
 
 type WorkflowNode = Node<WorkflowNodeData>;
@@ -100,6 +105,31 @@ const palette: Array<{ kind: NodeKind; label: string }> = [
   { kind: "custom-agent", label: "Custom Agent" },
 ];
 
+const nodeKindLabels: Record<NodeKind, string> = {
+  "recon-agent": "RECON",
+  "verification-step": "VERIFY",
+  "approval-gate": "APPROVAL",
+  "custom-agent": "AGENT",
+};
+
+function SecurityNode({ data, selected }: NodeProps<WorkflowNode>) {
+  return (
+    <div className={`security-node ${selected ? "is-selected" : ""} status-${data.status ?? "idle"}`}>
+      <Handle type="target" position={Position.Left} />
+      <div className="security-node__header">
+        <span className={`node-glyph node-glyph--${data.kind}`}>{nodeKindLabels[data.kind].slice(0, 1)}</span>
+        <span>{nodeKindLabels[data.kind]}</span>
+        <span className="node-live-dot" aria-label={data.status ?? "idle"} />
+      </div>
+      <strong>{data.label}</strong>
+      <small>{data.status ?? "Ready"}</small>
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+const nodeTypes = { security: SecurityNode };
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
@@ -111,7 +141,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 function toCanvasNode(node: CrystalFlow["nodes"][number]): WorkflowNode {
   return {
     id: node.id,
-    type: "default",
+    type: "security",
     position: node.position,
     data: { kind: node.type, label: node.label, config: node.config },
   };
@@ -162,7 +192,7 @@ export function App() {
   const statusByNode = new Map(nodeStatuses.map((nodeStatus) => [nodeStatus.nodeId, nodeStatus.status]));
   const visualNodes = nodes.map((node) => ({
     ...node,
-    className: statusByNode.has(node.id) ? `node-status-${statusByNode.get(node.id)}` : undefined,
+    data: { ...node.data, status: statusByNode.get(node.id) },
   }));
   const visualEdges = edges.map((edge) => ({
     ...edge,
@@ -225,7 +255,7 @@ export function App() {
     const position = reactFlow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
     const newNode: WorkflowNode = {
       id: crypto.randomUUID(),
-      type: "default",
+      type: "security",
       position,
       data: { kind, label: paletteItem.label, config: {} },
     };
@@ -339,176 +369,170 @@ export function App() {
   }
 
   return (
-    <main>
-      <header>
-        <p className="eyebrow">Single-Owner MVP</p>
-        <h1>Adaptive Security Orchestration</h1>
-        <p>Compose a versioned Crystal Flow, then start a host-audited run.</p>
-      </header>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark"><span /></div>
+          <div><strong>Crystal Flow</strong><small>Security Orchestration</small></div>
+        </div>
 
-      <section className="panel" aria-labelledby="create-flow-title">
-        <h2 id="create-flow-title">New Crystal Flow</h2>
-        <form onSubmit={createFlow}>
-          <label htmlFor="flow-name">Flow name</label>
-          <div className="actions">
+        <nav className="primary-nav" aria-label="Primary navigation">
+          <button className="nav-item is-active" type="button"><span className="nav-icon">⌘</span>Workflow Studio</button>
+          <button className="nav-item" type="button"><span className="nav-icon">◫</span>Run History<span className="nav-count">{run ? 1 : 0}</span></button>
+          <button className="nav-item" type="button"><span className="nav-icon">◇</span>Findings<span className="nav-count">{findings.length}</span></button>
+          <button className="nav-item" type="button"><span className="nav-icon">✓</span>Policy &amp; Scope</button>
+        </nav>
+
+        <div className="sidebar-section">
+          <div className="section-label"><span>CRYSTAL FLOWS</span><span>{savedFlows.length}</span></div>
+          <form className="quick-create" onSubmit={createFlow}>
             <input
-              id="flow-name"
-              minLength={1}
+              aria-label="New Crystal Flow name"
               maxLength={120}
               onChange={(event) => setFlowName(event.target.value)}
+              placeholder="New flow name"
               required
               value={flowName}
             />
-            <button type="submit">Create flow</button>
-          </div>
-        </form>
-        <div className="actions">
-          <button onClick={() => void provisionReferenceCatalog()} type="button">Provision reference catalog</button>
-          <p className="muted">Creates the five built-in Specialist Agents and the authorized-lab safety benchmark.</p>
-        </div>
-      </section>
-
-      <section className="panel" aria-labelledby="saved-flow-title">
-        <h2 id="saved-flow-title">Saved Crystal Flows</h2>
-        {savedFlows.length === 0 ? <p className="muted">No Crystal Flows yet.</p> : (
-          <ul className="saved-flows">
+            <button aria-label="Create Crystal Flow" className="icon-button" type="submit">+</button>
+          </form>
+          <div className="flow-list">
             {savedFlows.map((savedFlow) => (
-              <li key={savedFlow.id}>
-                <span>{savedFlow.name} · version {savedFlow.version}</span>
-                <button onClick={() => openFlow(savedFlow)} type="button">Open</button>
-              </li>
+              <button
+                className={`flow-list-item ${flow?.id === savedFlow.id ? "is-current" : ""}`}
+                key={savedFlow.id}
+                onClick={() => openFlow(savedFlow)}
+                type="button"
+              >
+                <span className="flow-indicator" />
+                <span><strong>{savedFlow.name}</strong><small>Version {savedFlow.version}</small></span>
+              </button>
             ))}
-          </ul>
+          </div>
+        </div>
+
+        <div className="sidebar-footer">
+          <div className="system-status"><span className="pulse-dot" /><span><strong>Control plane online</strong><small>Single-Owner · localhost</small></span></div>
+          <button className="owner-chip" type="button"><span>OW</span><span><strong>Owner workspace</strong><small>Full access</small></span><b>•••</b></button>
+        </div>
+      </aside>
+
+      <section className="main-workspace">
+        <header className="topbar">
+          <div>
+            <div className="breadcrumbs"><span>Workspace</span><b>/</b><span>{flow?.name ?? "Overview"}</span></div>
+            <h1>{flow?.name ?? "Workflow Studio"}</h1>
+          </div>
+          <div className="topbar-actions">
+            <div className="environment-pill"><span className="pulse-dot" />Authorized lab</div>
+            {flow && <button className="button secondary" onClick={saveFlow} type="button">Save version</button>}
+            {flow && <button className="button primary" onClick={startRun} type="button"><span>▶</span>{run ? "Start new run" : "Start run"}</button>}
+          </div>
+        </header>
+
+        {error && <div className="error-toast" role="alert"><strong>Action failed</strong><span>{error}</span><button onClick={() => setError(null)} type="button">×</button></div>}
+
+        {!flow ? (
+          <main className="empty-workspace">
+            <section className="welcome-card">
+              <div className="welcome-kicker">ADAPTIVE SECURITY ORCHESTRATION</div>
+              <h2>Design governed security workflows with confidence.</h2>
+              <p>Compose approved agents, scope every action, and preserve a complete evidence trail from one operational workspace.</p>
+              <div className="welcome-actions">
+                <button className="button primary" onClick={() => void provisionReferenceCatalog()} type="button">Provision reference catalog</button>
+                <span>Includes five Specialist Agents and a safe lab benchmark.</span>
+              </div>
+            </section>
+            <div className="overview-grid">
+              <article><span className="metric-icon cyan">⌘</span><strong>{savedFlows.length}</strong><small>Versioned flows</small></article>
+              <article><span className="metric-icon green">✓</span><strong>5</strong><small>Safety controls</small></article>
+              <article><span className="metric-icon amber">◇</span><strong>{findings.length}</strong><small>Evidence findings</small></article>
+            </div>
+          </main>
+        ) : (
+          <main className="studio-workspace">
+            <div className="studio-toolbar">
+              <div className="mode-tabs"><button className="is-active" type="button">Builder</button><button type="button">Run view</button></div>
+              <div className="flow-meta"><span>v{flow.version}</span><span>{nodes.length} nodes</span><span>{edges.length} branches</span>{run && <span className="run-live"><i />RUN LIVE</span>}</div>
+            </div>
+
+            <div className="studio-grid">
+              <aside className="palette-panel" aria-label="Approved Workflow Nodes">
+                <div className="panel-heading"><span>NODE LIBRARY</span><button type="button">⌕</button></div>
+                <p>Drag an approved capability onto the Canvas.</p>
+                <div className="palette-list">
+                  {palette.map((item) => (
+                    <button draggable key={item.kind} onDragStart={(event) => onDragStart(event, item.kind)} type="button">
+                      <span className={`node-glyph node-glyph--${item.kind}`}>{nodeKindLabels[item.kind].slice(0, 1)}</span>
+                      <span><strong>{item.label}</strong><small>{nodeKindLabels[item.kind]}</small></span>
+                      <b>⋮⋮</b>
+                    </button>
+                  ))}
+                </div>
+                <button className="catalog-button" onClick={() => void provisionReferenceCatalog()} type="button">+ Provision agent catalog</button>
+              </aside>
+
+              <section className="canvas-panel">
+                <div className="canvas-toolbar">
+                  <div><span className="canvas-state-dot" />Graph ready</div>
+                  <div><span>Drag to pan</span><span>Scroll to zoom</span></div>
+                </div>
+                <div className="canvas" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
+                  <ReactFlow
+                    edges={visualEdges}
+                    fitView
+                    nodeTypes={nodeTypes}
+                    nodes={visualNodes}
+                    onConnect={onConnect}
+                    onEdgeClick={(_, edge) => { setSelectedEdgeId(edge.id); setSelectedNodeId(null); }}
+                    onEdgesChange={(changes) => setEdges((current) => applyEdgeChanges(changes, current))}
+                    onInit={setReactFlow}
+                    onNodeClick={(_, node) => { setSelectedNodeId(node.id); setSelectedEdgeId(null); }}
+                    onNodesChange={(changes) => setNodes((current) => applyNodeChanges(changes, current))}
+                    onPaneClick={() => { setSelectedNodeId(null); setSelectedEdgeId(null); }}
+                  >
+                    <Background color="#26384a" gap={24} size={1} />
+                    <MiniMap maskColor="rgba(7, 14, 23, .78)" nodeColor="#2ed3c6" pannable zoomable />
+                    <Controls />
+                  </ReactFlow>
+                </div>
+              </section>
+
+              <aside className="inspector-panel" aria-label="Node and edge inspector">
+                <div className="panel-heading"><span>INSPECTOR</span><span className="selection-type">{selectedNode ? "NODE" : selectedEdge ? "EDGE" : "NONE"}</span></div>
+                {selectedNode ? (
+                  <div className="inspector-content">
+                    <div className="selected-identity"><span className={`node-glyph node-glyph--${selectedNode.data.kind}`}>{nodeKindLabels[selectedNode.data.kind].slice(0, 1)}</span><span><strong>{selectedNode.data.label}</strong><small>{nodeKindLabels[selectedNode.data.kind]} · {statusByNode.get(selectedNode.id) ?? "READY"}</small></span></div>
+                    <label htmlFor="node-label">Display name</label>
+                    <input id="node-label" onChange={(event) => updateSelectedNodeLabel(event.target.value)} value={selectedNode.data.label} />
+                    <label htmlFor="node-target">Target or task detail</label>
+                    <input id="node-target" onChange={(event) => updateSelectedNodeTarget(event.target.value)} placeholder="Declared task target" value={typeof selectedNode.data.config.target === "string" ? selectedNode.data.config.target : ""} />
+                    <div className="config-summary"><span><small>Status</small><strong>{statusByNode.get(selectedNode.id) ?? "Not started"}</strong></span><span><small>Messages</small><strong>{selectedNodeMessages.length}</strong></span><span><small>AI calls</small><strong>{selectedNodeInvocations.length}</strong></span></div>
+                    <InspectionList label="Agent Messages" values={selectedNodeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
+                    <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
+                  </div>
+                ) : selectedEdge ? (
+                  <div className="inspector-content"><div className="edge-route"><span>{selectedEdge.source}</span><b>→</b><span>{selectedEdge.target}</span></div><InspectionList label="Data transfer" values={selectedEdgeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} /></div>
+                ) : (
+                  <div className="inspector-empty"><span>⌖</span><strong>Nothing selected</strong><p>Select a node or branch to inspect its configuration, messages, and execution history.</p></div>
+                )}
+              </aside>
+            </div>
+
+            {run && (
+              <section className="operations-dock" aria-labelledby="execution-title">
+                <div className="dock-header"><div><span className="pulse-dot" /><span><strong id="execution-title">Live execution</strong><small>{run.id.slice(0, 12)} · polling every 2 seconds</small></span></div><button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh now</button></div>
+                <div className="dock-grid">
+                  <section><div className="dock-section-title"><span>NODE STATUS</span><b>{nodeStatuses.length}</b></div>{nodeStatuses.length === 0 ? <p className="empty-copy">Waiting for Workflow Node activity.</p> : <ul className="status-list">{nodeStatuses.map((item) => <li key={item.nodeId}><span>{item.nodeId}</span><span className={`status-pill status-${item.status}`}>{item.status}</span></li>)}</ul>}</section>
+                  <section><div className="dock-section-title"><span>EXECUTION TRAIL</span><b>{audit.length}</b></div><ul className="audit-list">{audit.map((event, index) => <li key={`${event.eventType}-${index}`}><i />{event.eventType}</li>)}</ul></section>
+                  <section><div className="dock-section-title"><span>FINDINGS</span><b>{findings.length}</b></div>{findings.length === 0 ? <p className="empty-copy">No Findings recorded.</p> : <ul className="finding-list">{findings.map((finding) => <li key={finding.id}><button className={selectedFindingId === finding.id ? "finding-selected" : ""} onClick={() => setSelectedFindingId(finding.id)} type="button">{finding.title}<small>{finding.target}</small></button></li>)}</ul>}</section>
+                </div>
+                {selectedFinding && <section className="finding-provenance" aria-label="Finding provenance"><div className="finding-title"><span>FINDING DETAIL</span><button onClick={() => setSelectedFindingId(null)} type="button">×</button></div><h3>{selectedFinding.title}</h3><p>{selectedFinding.target}</p><div className="provenance-grid"><InspectionList label="Supporting nodes" values={selectedFinding.provenance.nodeIds} /><InspectionList label="Agent Messages" values={selectedFinding.provenance.agentMessages.map((message) => `${message.sourceNodeId} · ${message.trigger}: ${JSON.stringify(message.message)}`)} /><InspectionList label="Tool calls & logs" values={selectedFinding.provenance.toolCalls.map((toolCall) => `${toolCall.status}: ${toolCall.stdout || toolCall.stderr || "No output"}`)} /><InspectionList label="Policy outcomes" values={selectedFinding.provenance.policyDecisions.map((decision) => `${decision.status}: ${decision.reason}`)} /><InspectionList label="Evidence artifacts" values={selectedFinding.provenance.evidenceArtifacts.map((artifact) => `${artifact.availability} · ${artifact.storage} · ${artifact.vmResidentPath ?? artifact.sha256}: ${artifact.summary}`)} /></div></section>}
+              </section>
+            )}
+          </main>
         )}
       </section>
-
-      {flow && (
-        <section className="panel" aria-labelledby="canvas-title">
-          <div className="canvas-heading">
-            <div>
-              <h2 id="canvas-title">{flow.name}</h2>
-              <p>Version {flow.version} · drag approved nodes, connect branches, then save a new version.</p>
-            </div>
-            <div className="actions">
-              <button onClick={saveFlow} type="button">Save new version</button>
-              <button onClick={startRun} type="button">Start run</button>
-            </div>
-          </div>
-          <div className="workflow-editor">
-            <aside aria-label="Approved Workflow Nodes" className="node-palette">
-              <h3>Approved nodes</h3>
-              {palette.map((item) => (
-                <button
-                  draggable
-                  key={item.kind}
-                  onDragStart={(event) => onDragStart(event, item.kind)}
-                  type="button"
-                >
-                  {item.label}
-                </button>
-              ))}
-            </aside>
-            <div className="canvas" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
-              <ReactFlow
-                edges={visualEdges}
-                fitView
-                nodes={visualNodes}
-                onConnect={onConnect}
-                onEdgeClick={(_, edge) => {
-                  setSelectedEdgeId(edge.id);
-                  setSelectedNodeId(null);
-                }}
-                onEdgesChange={(changes) => setEdges((current) => applyEdgeChanges(changes, current))}
-                onInit={setReactFlow}
-                onNodeClick={(_, node) => {
-                  setSelectedNodeId(node.id);
-                  setSelectedEdgeId(null);
-                }}
-                onNodesChange={(changes) => setNodes((current) => applyNodeChanges(changes, current))}
-              >
-                <Background />
-                <Controls />
-              </ReactFlow>
-            </div>
-            <aside aria-label="Node and edge inspector" className="node-config">
-              <h3>Node &amp; edge inspector</h3>
-              {selectedNode ? (
-                <>
-                  <p className="muted">{selectedNode.data.kind} · {statusByNode.get(selectedNode.id) ?? "not started"}</p>
-                  <label htmlFor="node-label">Label</label>
-                  <input
-                    id="node-label"
-                    onChange={(event) => updateSelectedNodeLabel(event.target.value)}
-                    value={selectedNode.data.label}
-                  />
-                  <label htmlFor="node-target">Target or task detail</label>
-                  <input
-                    id="node-target"
-                    onChange={(event) => updateSelectedNodeTarget(event.target.value)}
-                    value={typeof selectedNode.data.config.target === "string" ? selectedNode.data.config.target : ""}
-                  />
-                  <InspectionList label="Agent Messages" values={selectedNodeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
-                  <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
-                </>
-              ) : selectedEdge ? (
-                <>
-                  <p className="muted">{selectedEdge.source} → {selectedEdge.target}</p>
-                  <InspectionList label="Data transfer" values={selectedEdgeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
-                </>
-              ) : <p className="muted">Select a node or edge to inspect it.</p>}
-            </aside>
-          </div>
-        </section>
-      )}
-
-      {run && (
-        <section className="panel" aria-labelledby="execution-title">
-          <div className="canvas-heading">
-            <div>
-              <h2 id="execution-title">Live execution &amp; audit</h2>
-              <p>Run {run.id} is {run.status}. Status and data transfer refresh every two seconds.</p>
-            </div>
-            <button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh</button>
-          </div>
-          <div className="execution-grid">
-            <section>
-              <h3>Node status</h3>
-              {nodeStatuses.length === 0 ? <p className="muted">No Workflow Node activity yet.</p> : (
-                <ul className="status-list">{nodeStatuses.map((nodeStatus) => (
-                  <li key={nodeStatus.nodeId}><span>{nodeStatus.nodeId}</span><span className={`status-pill status-${nodeStatus.status}`}>{nodeStatus.status}</span></li>
-                ))}</ul>
-              )}
-              <h3>Execution Trail</h3>
-              <ul className="audit-list">{audit.map((event, index) => <li key={`${event.eventType}-${index}`}>{event.eventType}</li>)}</ul>
-            </section>
-            <section>
-              <h3>Findings</h3>
-              {findings.length === 0 ? <p className="muted">No Findings recorded for this run.</p> : (
-                <ul className="finding-list">{findings.map((finding) => (
-                  <li key={finding.id}>
-                    <button className={selectedFindingId === finding.id ? "finding-selected" : ""} onClick={() => setSelectedFindingId(finding.id)} type="button">
-                      {finding.title}
-                    </button>
-                  </li>
-                ))}</ul>
-              )}
-              {selectedFinding && (
-                <section className="finding-provenance" aria-label="Finding provenance">
-                  <h4>{selectedFinding.title}</h4>
-                  <p className="muted">{selectedFinding.target}</p>
-                  <InspectionList label="Supporting Workflow Nodes" values={selectedFinding.provenance.nodeIds} />
-                  <InspectionList label="Agent Messages" values={selectedFinding.provenance.agentMessages.map((message) => `${message.sourceNodeId} · ${message.trigger}: ${JSON.stringify(message.message)}`)} />
-                  <InspectionList label="Tool calls and logs" values={selectedFinding.provenance.toolCalls.map((toolCall) => `${toolCall.status}: ${toolCall.stdout || toolCall.stderr || "No output"}`)} />
-                  <InspectionList label="Policy outcomes and Approvals" values={selectedFinding.provenance.policyDecisions.map((decision) => `${decision.status}: ${decision.reason}`)} />
-                  <InspectionList label="Evidence artifacts" values={selectedFinding.provenance.evidenceArtifacts.map((artifact) => `${artifact.availability} · ${artifact.storage} · ${artifact.vmResidentPath ?? artifact.sha256}: ${artifact.summary}`)} />
-                </section>
-              )}
-            </section>
-          </div>
-        </section>
-      )}
-
-      {error && <p className="error" role="alert">{error}</p>}
-    </main>
+    </div>
   );
 }
