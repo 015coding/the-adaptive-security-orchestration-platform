@@ -371,6 +371,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
       } else {
         edges.push({ id: "ctf-recon-verification", source: "ctf-recon", target: "ctf-verification" });
       }
+      edges.push({ id: "ctf-verification-exit", source: "ctf-verification", target: "ctf-exit" });
       const saved = await request<CrystalFlow>(`/api/crystal-flows/${created.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
