@@ -31,6 +31,10 @@ export DEBIAN_SSH_TARGET=assessment-runner@debian-vm
 
 The remote `assessment-runner` account must be restricted by the VM configuration to its assigned Run Workspace and approved network targets. The host API passes only the Scope-derived workspace and timeout to SSH; it does not grant the Owner host filesystem to VM tasks.
 
+## Configure the Codex CLI Session Adapter
+
+Set `CODEX_SESSION_COMMAND` to a local bridge client for the one currently running Codex CLI session. The bridge reads one structured JSON request from standard input and returns JSON with `output` and `resourceUnits` fields. The API serializes all AI-node requests through that bridge and records their result, timeout, and resource usage.
+
 ## Verify
 
 ```sh

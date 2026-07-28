@@ -11,6 +11,13 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.policy import PolicyEngine, ScopePolicyInput
+from app.session_adapter import (
+    CodexCli,
+    CodexCliError,
+    CodexCliTimeout,
+    SessionAdapter,
+    SubprocessCodexCli,
+)
 from app.vm_runner import SshVmRunner, VmCommandResult, VmRunnerError
 
 APPROVED_WORKFLOW_NODE_TYPES = {
@@ -160,6 +167,24 @@ class RunLogBundleResponse(BaseModel):
     artifactReferences: list[str]
 
 
+class CreateAiNodeRequest(BaseModel):
+    nodeId: str = Field(min_length=1)
+    task: str = Field(min_length=1)
+    input: dict[str, object]
+    timeoutSeconds: int = Field(ge=1)
+    maxResourceUnits: int = Field(ge=1)
+
+
+class AiNodeInvocationResponse(BaseModel):
+    id: str
+    runId: str
+    nodeId: str
+    status: str
+    output: dict[str, object]
+    timeoutSeconds: int
+    resourceUnits: int
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -231,6 +256,16 @@ def _initialize_database(database_path: Path) -> None:
                 artifact_references_json TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ai_node_invocations (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+                node_id TEXT NOT NULL,
+                invocation_status TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                timeout_seconds INTEGER NOT NULL,
+                resource_units INTEGER NOT NULL
+            );
+
             INSERT OR IGNORE INTO crystal_flow_versions (
                 crystal_flow_id, version, nodes_json, edges_json
             )
@@ -239,7 +274,11 @@ def _initialize_database(database_path: Path) -> None:
         )
 
 
-def create_app(database_path: Path | str = Path("data/platform.db"), vm_runner: object | None = None) -> FastAPI:
+def create_app(
+    database_path: Path | str = Path("data/platform.db"),
+    vm_runner: object | None = None,
+    codex_cli: CodexCli | None = None,
+) -> FastAPI:
     resolved_database_path = Path(database_path)
 
     @asynccontextmanager
@@ -250,6 +289,7 @@ def create_app(database_path: Path | str = Path("data/platform.db"), vm_runner: 
     app = FastAPI(title="Adaptive Security Orchestration Platform", lifespan=lifespan)
     policy_engine = PolicyEngine()
     configured_vm_runner = vm_runner or SshVmRunner.from_environment()
+    session_adapter = SessionAdapter(codex_cli or SubprocessCodexCli())
 
     def current_crystal_flow(connection: sqlite3.Connection, crystal_flow_id: str) -> CrystalFlowResponse | None:
         flow = connection.execute(
@@ -558,6 +598,98 @@ def create_app(database_path: Path | str = Path("data/platform.db"), vm_runner: 
                 artifactReferences=json.loads(bundle["artifact_references_json"]),
             )
             for bundle in bundles
+        ]
+
+    @app.post(
+        "/api/runs/{run_id}/ai-nodes",
+        response_model=AiNodeInvocationResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def execute_ai_node(run_id: str, request: CreateAiNodeRequest) -> AiNodeInvocationResponse:
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute(
+                "SELECT crystal_flow_id FROM workflow_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+            session_request = {
+                "runId": run_id,
+                "nodeId": request.nodeId,
+                "task": request.task,
+                "input": request.input,
+            }
+            try:
+                result = session_adapter.execute(session_request, request.timeoutSeconds)
+                invocation_status = (
+                    "completed" if result.resource_units <= request.maxResourceUnits else "resource-exceeded"
+                )
+                output = result.output
+                resource_units = result.resource_units
+            except CodexCliTimeout as error:
+                invocation_status = "timeout"
+                output = {"reason": str(error)}
+                resource_units = 0
+            except CodexCliError as error:
+                invocation_status = "failed"
+                output = {"reason": str(error)}
+                resource_units = 0
+            invocation_id = uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO ai_node_invocations (
+                    id, run_id, node_id, invocation_status, output_json, timeout_seconds, resource_units
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invocation_id,
+                    run_id,
+                    request.nodeId,
+                    invocation_status,
+                    json.dumps(output),
+                    request.timeoutSeconds,
+                    resource_units,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id)
+                VALUES (?, ?, ?)
+                """,
+                (f"ai-node.{invocation_status}", run_id, run["crystal_flow_id"]),
+            )
+        return AiNodeInvocationResponse(
+            id=invocation_id,
+            runId=run_id,
+            nodeId=request.nodeId,
+            status=invocation_status,
+            output=output,
+            timeoutSeconds=request.timeoutSeconds,
+            resourceUnits=resource_units,
+        )
+
+    @app.get("/api/runs/{run_id}/ai-node-invocations", response_model=list[AiNodeInvocationResponse])
+    def list_ai_node_invocations(run_id: str) -> list[AiNodeInvocationResponse]:
+        with _connect(resolved_database_path) as connection:
+            invocations = connection.execute(
+                """
+                SELECT id, run_id, node_id, invocation_status, output_json, timeout_seconds, resource_units
+                FROM ai_node_invocations
+                WHERE run_id = ?
+                ORDER BY rowid
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            AiNodeInvocationResponse(
+                id=invocation["id"],
+                runId=invocation["run_id"],
+                nodeId=invocation["node_id"],
+                status=invocation["invocation_status"],
+                output=json.loads(invocation["output_json"]),
+                timeoutSeconds=invocation["timeout_seconds"],
+                resourceUnits=invocation["resource_units"],
+            )
+            for invocation in invocations
         ]
 
     @app.post(

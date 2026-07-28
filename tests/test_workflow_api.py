@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.session_adapter import CodexCliResult, CodexCliTimeout
 from app.vm_runner import VmCommandResult
 
 
@@ -22,6 +23,23 @@ class ControlledVmRunner:
             }
         )
         return VmCommandResult(exit_code=0, stdout="target discovered", stderr="")
+
+
+class ControlledCodexCli:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def execute(self, request: dict[str, object], timeout_seconds: int) -> CodexCliResult:
+        self.requests.append({"request": request, "timeout_seconds": timeout_seconds})
+        return CodexCliResult(
+            output={"summary": "API surface identified", "nextBranch": "verify"},
+            resource_units=4,
+        )
+
+
+class TimingOutCodexCli:
+    def execute(self, request: dict[str, object], timeout_seconds: int) -> CodexCliResult:
+        raise CodexCliTimeout("Codex CLI session exceeded Node Timeout")
 
 
 def test_owner_can_create_reopen_and_run_a_blank_crystal_flow(tmp_path):
@@ -259,6 +277,79 @@ def test_out_of_scope_vm_task_is_blocked_without_calling_the_vm_runner(tmp_path)
     assert task.json()["status"] == "blocked"
     assert task.json()["stderr"] == "target is outside Scope"
     assert runner.calls == []
+
+
+def test_ai_node_uses_the_session_adapter_and_records_output_timeout_and_resource_use(tmp_path):
+    codex_cli = ControlledCodexCli()
+    app = create_app(database_path=tmp_path / "platform.db", codex_cli=codex_cli)
+
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "AI assessment"}).json()
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        invocation = client.post(
+            f"/api/runs/{run['id']}/ai-nodes",
+            json={
+                "nodeId": "recon-1",
+                "task": "Identify the API surface",
+                "input": {"target": "https://lab.example.test"},
+                "timeoutSeconds": 30,
+                "maxResourceUnits": 10,
+            },
+        )
+
+        assert invocation.status_code == 201
+        assert invocation.json() == {
+            "id": invocation.json()["id"],
+            "runId": run["id"],
+            "nodeId": "recon-1",
+            "status": "completed",
+            "output": {"summary": "API surface identified", "nextBranch": "verify"},
+            "timeoutSeconds": 30,
+            "resourceUnits": 4,
+        }
+        assert codex_cli.requests == [
+            {
+                "request": {
+                    "runId": run["id"],
+                    "nodeId": "recon-1",
+                    "task": "Identify the API surface",
+                    "input": {"target": "https://lab.example.test"},
+                },
+                "timeout_seconds": 30,
+            }
+        ]
+
+        recorded = client.get(f"/api/runs/{run['id']}/ai-node-invocations")
+        assert recorded.status_code == 200
+        assert recorded.json() == [invocation.json()]
+
+        audit = client.get(f"/api/runs/{run['id']}/audit")
+        assert [event["eventType"] for event in audit.json()] == ["run.created", "ai-node.completed"]
+
+
+def test_ai_node_timeout_is_recorded_in_the_execution_trail(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db", codex_cli=TimingOutCodexCli())
+
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Timeout assessment"}).json()
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        invocation = client.post(
+            f"/api/runs/{run['id']}/ai-nodes",
+            json={
+                "nodeId": "recon-1",
+                "task": "Identify the API surface",
+                "input": {},
+                "timeoutSeconds": 1,
+                "maxResourceUnits": 10,
+            },
+        )
+
+        audit = client.get(f"/api/runs/{run['id']}/audit")
+
+    assert invocation.status_code == 201
+    assert invocation.json()["status"] == "timeout"
+    assert invocation.json()["resourceUnits"] == 0
+    assert [event["eventType"] for event in audit.json()] == ["run.created", "ai-node.timeout"]
 
 
 def test_owner_cannot_create_a_crystal_flow_with_a_whitespace_only_name(tmp_path):
