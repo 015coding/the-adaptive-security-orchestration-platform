@@ -1,0 +1,27 @@
+:root {
+  background: #0d1720;
+  color: #e7edf2;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+body { margin: 0; }
+
+main { margin: 0 auto; max-width: 760px; padding: 3rem 1.5rem; }
+
+h1, h2, p { margin-top: 0; }
+
+.eyebrow { color: #71d8b2; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; }
+
+.panel { background: #162531; border: 1px solid #2a4658; border-radius: 12px; margin-top: 1.25rem; padding: 1.25rem; }
+
+.actions { display: flex; gap: 0.75rem; margin-top: 0.5rem; }
+
+input { background: #0d1720; border: 1px solid #597589; border-radius: 6px; color: inherit; flex: 1; padding: 0.65rem; }
+
+button { background: #71d8b2; border: 0; border-radius: 6px; color: #082016; cursor: pointer; font-weight: 700; padding: 0.65rem 0.9rem; }
+
+.muted { color: #9fb2bf; }
+.error { color: #ff9d9d; }
+
+.saved-flows { list-style: none; margin: 0; padding: 0; }
+.saved-flows li { align-items: center; display: flex; gap: 1rem; justify-content: space-between; padding: 0.5rem 0; }
