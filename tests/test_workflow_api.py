@@ -177,6 +177,67 @@ def test_owner_can_use_start_worker_and_exit_nodes(tmp_path):
         ]
 
 
+def test_start_run_executes_a_crystal_flow_and_records_live_activity(tmp_path):
+    vm_runner = ControlledVmRunner()
+    codex_cli = ControlledCodexCli()
+    app = create_app(database_path=tmp_path / "platform.db", vm_runner=vm_runner, codex_cli=codex_cli)
+    now = datetime.now(UTC)
+
+    with TestClient(app) as client:
+        scope = client.post(
+            "/api/scopes",
+            json={
+                "targets": ["https://lab.example.test"],
+                "workspace": "/srv/adaptive-security/runs/flow-run",
+                "allowedActions": ["reconnaissance"],
+                "resourceLimits": {
+                    "maxRequestsPerSecond": 5,
+                    "maxConcurrentTasks": 1,
+                    "maxRuntimeSeconds": 600,
+                },
+                "startsAt": now.isoformat(),
+                "expiresAt": (now + timedelta(hours=1)).isoformat(),
+                "unattendedExecution": False,
+                "authorizedLabEnvironment": True,
+            },
+        ).json()
+        flow = client.post("/api/crystal-flows", json={"name": "Executable flow"}).json()
+        saved = client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [
+                    {"id": "start", "type": "start-node", "label": "Start", "position": {"x": 0, "y": 0}, "config": {"branches": {"started": "worker"}}},
+                    {"id": "worker", "type": "recon-agent", "label": "Recon", "position": {"x": 200, "y": 0}, "config": {"scopeId": scope["id"], "target": "https://lab.example.test", "action": "reconnaissance", "branches": {"completed": "exit"}}},
+                    {"id": "exit", "type": "exit-node", "label": "Exit", "position": {"x": 400, "y": 0}, "config": {}},
+                ],
+                "edges": [
+                    {"id": "start-worker", "source": "start", "target": "worker"},
+                    {"id": "worker-exit", "source": "worker", "target": "exit"},
+                ],
+            },
+        )
+        assert saved.status_code == 200
+
+        started = client.post(f"/api/crystal-flows/{flow['id']}/runs")
+        run = started.json()
+        current = client.get(f"/api/runs/{run['id']}")
+        statuses = client.get(f"/api/runs/{run['id']}/node-statuses")
+        messages = client.get(f"/api/runs/{run['id']}/agent-messages")
+        audit = client.get(f"/api/runs/{run['id']}/audit")
+
+    assert started.status_code == 201
+    assert current.json()["status"] == "completed"
+    assert {item["nodeId"]: item["status"] for item in statuses.json()} == {
+        "start": "completed",
+        "worker": "completed",
+        "exit": "completed",
+    }
+    assert messages.json()[0]["targetNodeId"] == "worker"
+    assert messages.json()[-1]["targetNodeId"] == "exit"
+    assert codex_cli.requests[0]["request"]["nodeId"] == "worker"
+    assert any(event["eventType"] == "run.completed" for event in audit.json())
+
+
 def test_owner_can_delete_a_crystal_flow_and_its_run_records(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 

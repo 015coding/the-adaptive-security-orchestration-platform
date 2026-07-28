@@ -577,13 +577,15 @@ export function App() {
 
   async function refreshRunDetails(runId: string) {
     try {
-      const [nextAudit, nextStatuses, nextMessages, nextInvocations, nextFindings] = await Promise.all([
+      const [nextRun, nextAudit, nextStatuses, nextMessages, nextInvocations, nextFindings] = await Promise.all([
+        request<WorkflowRun>(`/api/runs/${runId}`),
         request<AuditEvent[]>(`/api/runs/${runId}/audit`),
         request<NodeStatus[]>(`/api/runs/${runId}/node-statuses`),
         request<AgentMessage[]>(`/api/runs/${runId}/agent-messages`),
         request<AiNodeInvocation[]>(`/api/runs/${runId}/ai-node-invocations`),
         request<Finding[]>(`/api/runs/${runId}/findings`),
       ]);
+      setRun(nextRun);
       setAudit(nextAudit);
       setNodeStatuses(nextStatuses);
       setAgentMessages(nextMessages);
@@ -947,7 +949,7 @@ export function App() {
           <main className="studio-workspace">
             <div className="studio-toolbar">
               <div className="mode-tabs"><button className="is-active" type="button">Builder</button><button type="button">Run view</button></div>
-              <div className="flow-meta"><span>v{flow.version}</span><span>{nodes.length} nodes</span><span>{edges.length} branches</span>{run && <span className="run-live"><i />RUN LIVE</span>}</div>
+              <div className="flow-meta"><span>v{flow.version}</span><span>{nodes.length} nodes</span><span>{edges.length} branches</span>{run && <span className={`run-live run-${run.status}`}><i />{run.status.toUpperCase()}</span>}</div>
             </div>
 
             <div className="studio-grid">
@@ -1051,7 +1053,7 @@ export function App() {
 
             {run && (
               <section className="operations-dock" aria-labelledby="execution-title">
-                <div className="dock-header"><div><span className="pulse-dot" /><span><strong id="execution-title">Live execution</strong><small>{run.id.slice(0, 12)} · polling every 2 seconds</small></span></div><button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh now</button></div>
+                <div className="dock-header"><div><span className={`pulse-dot ${run.status !== "running" ? "pulse-static" : ""}`} /><span><strong id="execution-title">Live execution · {run.status}</strong><small>{run.id.slice(0, 12)} · polling every 2 seconds</small></span></div><button onClick={() => void refreshRunDetails(run.id)} type="button">Refresh now</button></div>
                 <div className="dock-grid">
                   <section><div className="dock-section-title"><span>NODE STATUS</span><b>{nodeStatuses.length}</b></div>{nodeStatuses.length === 0 ? <p className="empty-copy">Waiting for Workflow Node activity.</p> : <ul className="status-list">{nodeStatuses.map((item) => <li key={item.nodeId}><span>{item.nodeId}</span><span className={`status-pill status-${item.status}`}>{item.status}</span></li>)}</ul>}</section>
                   <section><div className="dock-section-title"><span>EXECUTION TRAIL</span><b>{audit.length}</b></div><ul className="audit-list">{audit.map((event, index) => <li key={`${event.eventType}-${index}`}><i />{event.eventType}</li>)}</ul></section>

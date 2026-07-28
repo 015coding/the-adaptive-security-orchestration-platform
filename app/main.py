@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import uuid4
 
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.policy import PolicyEngine, PolicyOutcome, ScopePolicyInput
@@ -1023,6 +1023,223 @@ def create_app(
             unattended_execution=bool(scope["unattended_execution"]),
             authorized_lab_environment=bool(scope["authorized_lab_environment"]),
         )
+
+    def set_run_status(run_id: str, run_status: str) -> None:
+        with _connect(resolved_database_path) as connection:
+            connection.execute("UPDATE workflow_runs SET status = ? WHERE id = ?", (run_status, run_id))
+
+    def record_run_event(run_id: str, event_type: str, crystal_flow_id: str) -> None:
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                "INSERT INTO execution_trail_events (event_type, run_id, crystal_flow_id) VALUES (?, ?, ?)",
+                (event_type, run_id, crystal_flow_id),
+            )
+
+    def set_node_status(run_id: str, node_id: str, node_status: str) -> None:
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO node_statuses (run_id, node_id, status) VALUES (?, ?, ?)",
+                (run_id, node_id, node_status),
+            )
+
+    def record_agent_message(
+        run_id: str,
+        source_node_id: str,
+        target_node_id: str | None,
+        trigger: str,
+        message: dict[str, object],
+    ) -> None:
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_messages (
+                    id, run_id, source_node_id, target_node_id, trigger, message_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (uuid4().hex, run_id, source_node_id, target_node_id, trigger, json.dumps(message)),
+            )
+
+    def orchestrate_run(run_id: str) -> None:
+        """Execute a bounded Crystal Flow in the background after Start Run."""
+        try:
+            with _connect(resolved_database_path) as connection:
+                run = connection.execute(
+                    "SELECT crystal_flow_id FROM workflow_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    return
+                flow = current_crystal_flow(connection, run["crystal_flow_id"])
+            if flow is None:
+                set_run_status(run_id, "failed")
+                return
+
+            flow_nodes = {node["id"]: node for node in flow.nodes}
+            if not flow.nodes:
+                # A blank flow is still a valid draft, but there is nothing to execute.
+                return
+            outgoing = {}
+            for edge in flow.edges:
+                outgoing.setdefault(edge["source"], []).append(edge["target"])
+            start_nodes = [node for node in flow.nodes if node["type"] == "start-node"]
+            if not start_nodes:
+                # Runs without an explicit Start node remain available for the
+                # existing manual node-result API; they are not auto-executed.
+                return
+            current_node_id = start_nodes[0]["id"]
+            previous_output: dict[str, object] = {}
+            attempts: dict[tuple[str, str], int] = {}
+            set_run_status(run_id, "running")
+            record_run_event(run_id, "run.started", flow.id)
+
+            for _ in range(100):
+                if current_node_id is None:
+                    set_run_status(run_id, "completed")
+                    record_run_event(run_id, "run.completed", flow.id)
+                    return
+                node = flow_nodes.get(current_node_id)
+                if node is None:
+                    set_run_status(run_id, "failed")
+                    record_run_event(run_id, "run.failed.node-not-found", flow.id)
+                    return
+                node_id = node["id"]
+                config = node.get("config", {})
+                set_node_status(run_id, node_id, "running")
+                record_run_event(run_id, f"node.started.{node_id}", flow.id)
+
+                node_type = node["type"]
+                if node_type == "exit-node":
+                    set_node_status(run_id, node_id, "completed")
+                    record_run_event(run_id, f"node.completed.{node_id}", flow.id)
+                    set_run_status(run_id, "completed")
+                    record_run_event(run_id, "run.completed", flow.id)
+                    return
+
+                if node_type == "approval-gate":
+                    set_node_status(run_id, node_id, "needs-human-review")
+                    record_agent_message(run_id, node_id, None, "approval-required", {"reason": "Owner Approval is required before continuing"})
+                    record_run_event(run_id, "node.needs-human-review", flow.id)
+                    set_run_status(run_id, "waiting-for-approval")
+                    return
+
+                trigger = "started" if node_type == "start-node" else "completed"
+                output: dict[str, object]
+                node_status = "completed"
+                action = config.get("action") if isinstance(config, dict) else None
+                if not isinstance(action, str):
+                    action = "verification"
+                scope_id = config.get("scopeId") if isinstance(config, dict) else None
+                target = config.get("target") if isinstance(config, dict) else None
+
+                if node_type == "start-node":
+                    output = {"status": "started", "nodeId": node_id}
+                elif not isinstance(scope_id, str) or not isinstance(target, str):
+                    node_status = "failed"
+                    output = {"reason": "Node requires a Scope ID and target"}
+                else:
+                    with _connect(resolved_database_path) as connection:
+                        scope = connection.execute("SELECT * FROM scopes WHERE id = ?", (scope_id,)).fetchone()
+                    if scope is None:
+                        node_status = "failed"
+                        output = {"reason": "Scope not found"}
+                    else:
+                        outcome = policy_engine.evaluate(scope_policy_input(scope), target=target, action=action)
+                        with _connect(resolved_database_path) as connection:
+                            decision_id = uuid4().hex
+                            connection.execute(
+                                "INSERT INTO policy_decisions (id, scope_id, target, action, decision_status, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                                (decision_id, scope_id, target, action, outcome.status, outcome.reason),
+                            )
+                        record_run_event(run_id, f"policy.{outcome.status}.{node_id}", flow.id)
+                        if outcome.status != "allow":
+                            node_status = "needs-human-review" if outcome.status == "approval-required" else "blocked"
+                            output = {"reason": outcome.reason, "policyDecisionId": decision_id}
+                            set_node_status(run_id, node_id, node_status)
+                            record_agent_message(run_id, node_id, None, "policy-blocked", output)
+                            set_run_status(run_id, "waiting-for-approval" if outcome.status == "approval-required" else "blocked")
+                            record_run_event(run_id, f"node.{node_status}", flow.id)
+                            return
+
+                        if action == "file-analysis":
+                            command = config.get("command") if isinstance(config.get("command"), list) else ["file", target]
+                            try:
+                                limits = json.loads(scope["resource_limits_json"])
+                                result = configured_vm_runner.execute(
+                                    environment=str(config.get("environment", "kali")),
+                                    workspace=scope["workspace"],
+                                    command=[str(item) for item in command],
+                                    timeout_seconds=limits["maxRuntimeSeconds"],
+                                )
+                                node_status = "completed" if result.exit_code == 0 else "failed"
+                                output = {"stdout": result.stdout, "stderr": result.stderr, "exitCode": result.exit_code}
+                            except VmRunnerError as error:
+                                node_status = "failed"
+                                output = {"reason": str(error)}
+                        else:
+                            model = config.get("model") if isinstance(config.get("model"), str) else None
+                            effort = config.get("reasoningEffort") if isinstance(config.get("reasoningEffort"), str) else "medium"
+                            timeout_seconds = int(config.get("timeoutSeconds", 120))
+                            max_resource_units = int(config.get("maxResourceUnits", 50))
+                            session_request = {
+                                "runId": run_id,
+                                "nodeId": node_id,
+                                "task": str(config.get("task", f"Execute the {node.get('label', node_type)} step for the authorized target.")),
+                                "input": {"target": target, "previous": previous_output},
+                                "model": model,
+                                "reasoningEffort": effort,
+                            }
+                            try:
+                                result = session_adapter.execute(session_request, timeout_seconds)
+                                node_status = "completed" if result.resource_units <= max_resource_units else "resource-exceeded"
+                                output = result.output
+                                with _connect(resolved_database_path) as connection:
+                                    connection.execute(
+                                        "INSERT INTO ai_node_invocations (id, run_id, node_id, invocation_status, output_json, model, reasoning_effort, timeout_seconds, resource_units) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                        (uuid4().hex, run_id, node_id, node_status, json.dumps(output), model, effort, timeout_seconds, result.resource_units),
+                                    )
+                            except CodexCliTimeout as error:
+                                node_status = "timeout"
+                                output = {"reason": str(error)}
+                            except CodexCliError as error:
+                                node_status = "failed"
+                                output = {"reason": str(error)}
+
+                set_node_status(run_id, node_id, node_status)
+                record_run_event(run_id, f"node.{node_status}", flow.id)
+                previous_output = output
+                if node_status != "completed":
+                    set_run_status(run_id, node_status)
+                    record_run_event(run_id, "run.failed", flow.id)
+                    record_agent_message(run_id, node_id, None, "execution-stopped", output)
+                    return
+                branches = config.get("branches", {}) if isinstance(config, dict) else {}
+                next_node_id = branches.get(trigger) if isinstance(branches, dict) else None
+                if next_node_id is None and node_type not in {"start-node", "exit-node"}:
+                    next_node_id = (outgoing.get(node_id) or [None])[0]
+                if next_node_id is not None:
+                    loop_key = (node_id, trigger)
+                    attempts[loop_key] = attempts.get(loop_key, 0) + 1
+                    bounded_loop = config.get("boundedLoop") if isinstance(config, dict) else None
+                    if isinstance(bounded_loop, dict) and bounded_loop.get("trigger") == trigger and attempts[loop_key] > int(bounded_loop.get("maxAttempts", 1)):
+                        set_node_status(run_id, node_id, "needs-human-review")
+                        set_run_status(run_id, "waiting-for-approval")
+                        record_run_event(run_id, "run.bounded-loop-limit", flow.id)
+                        return
+                    record_agent_message(run_id, node_id, next_node_id, trigger, output)
+                    set_node_status(run_id, next_node_id, "queued")
+                else:
+                    set_run_status(run_id, "completed" if node_status == "completed" else node_status)
+                    record_run_event(run_id, "run.completed" if node_status == "completed" else "run.failed", flow.id)
+                    return
+                current_node_id = next_node_id
+
+            set_run_status(run_id, "failed")
+            record_run_event(run_id, "run.step-limit-exceeded", flow.id)
+        except Exception as error:
+            set_run_status(run_id, "failed")
+            with _connect(resolved_database_path) as connection:
+                run = connection.execute("SELECT crystal_flow_id FROM workflow_runs WHERE id = ?", (run_id,)).fetchone()
+            if run is not None:
+                record_run_event(run_id, f"run.failed.{type(error).__name__}", run["crystal_flow_id"])
 
     def save_scope_version(
         connection: sqlite3.Connection,
@@ -2211,7 +2428,7 @@ def create_app(
         response_model=RunResponse,
         status_code=status.HTTP_201_CREATED,
     )
-    def create_run(crystal_flow_id: str) -> RunResponse:
+    def create_run(crystal_flow_id: str, background_tasks: BackgroundTasks) -> RunResponse:
         run_id = uuid4().hex
         with _connect(resolved_database_path) as connection:
             flow_exists = connection.execute(
@@ -2230,7 +2447,18 @@ def create_app(
                 """,
                 ("run.created", run_id, crystal_flow_id),
             )
+        background_tasks.add_task(orchestrate_run, run_id)
         return RunResponse(id=run_id, crystalFlowId=crystal_flow_id, status="created")
+
+    @app.get("/api/runs/{run_id}", response_model=RunResponse)
+    def get_run(run_id: str) -> RunResponse:
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute(
+                "SELECT id, crystal_flow_id, status FROM workflow_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        return RunResponse(id=run["id"], crystalFlowId=run["crystal_flow_id"], status=run["status"])
 
     @app.get("/api/runs/{run_id}/audit", response_model=list[AuditEventResponse])
     def get_run_audit(run_id: str) -> list[AuditEventResponse]:
