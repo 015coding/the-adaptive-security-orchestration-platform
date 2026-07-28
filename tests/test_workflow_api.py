@@ -364,6 +364,40 @@ def test_owner_can_create_a_governed_custom_agent_and_enable_its_plugin_in_a_cry
     assert saved.json()["version"] == 3
 
 
+def test_owner_can_provision_and_compose_reference_agents_in_a_lab_benchmark_flow(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        catalog = client.post("/api/reference-catalog")
+        repeated_catalog = client.post("/api/reference-catalog")
+        agents = client.get("/api/reference-agents")
+        benchmarks = client.get("/api/benchmark-flows")
+        benchmark_flow = client.get(f"/api/crystal-flows/{benchmarks.json()[0]['crystalFlowId']}")
+        enabled_plugins = client.get(f"/api/crystal-flows/{benchmark_flow.json()['id']}/plugins")
+
+    assert catalog.status_code == 201
+    assert repeated_catalog.status_code == 201
+    assert [agent["name"] for agent in agents.json()] == [
+        "Recon Agent",
+        "Repository/Code Review Agent",
+        "Web/API Review Agent",
+        "Verification Agent",
+        "Reporting Agent",
+    ]
+    assert len(benchmarks.json()) == 1
+    assert set(benchmarks.json()[0]["demonstrates"]) == {
+        "policy-blocking",
+        "approval",
+        "bounded-adaptation",
+        "timeout-handling",
+        "evidence-reconstruction",
+    }
+    assert {node["config"].get("customAgentId") for node in benchmark_flow.json()["nodes"] if node["type"] == "custom-agent"} == {
+        agent["id"] for agent in agents.json()
+    }
+    assert len(enabled_plugins.json()) == 5
+
+
 def test_permitted_vm_task_runs_in_the_scope_workspace_and_returns_a_host_log_bundle(tmp_path):
     runner = ControlledVmRunner()
     app = create_app(database_path=tmp_path / "platform.db", vm_runner=runner)

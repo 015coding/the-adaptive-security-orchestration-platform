@@ -89,6 +89,10 @@ type Finding = {
   };
 };
 
+type ReferenceCatalog = {
+  benchmarkFlowId: string;
+};
+
 const palette: Array<{ kind: NodeKind; label: string }> = [
   { kind: "recon-agent", label: "Recon Agent" },
   { kind: "verification-step", label: "Verification Step" },
@@ -263,6 +267,21 @@ export function App() {
     }
   }
 
+  async function provisionReferenceCatalog() {
+    setError(null);
+    try {
+      const catalog = await request<ReferenceCatalog>("/api/reference-catalog", { method: "POST" });
+      const [benchmarkFlow, flows] = await Promise.all([
+        request<CrystalFlow>(`/api/crystal-flows/${catalog.benchmarkFlowId}`),
+        request<CrystalFlow[]>("/api/crystal-flows"),
+      ]);
+      setSavedFlows(flows);
+      openFlow(benchmarkFlow);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to provision the reference catalog");
+    }
+  }
+
   function openFlow(selectedFlow: CrystalFlow) {
     setFlow(selectedFlow);
     setNodes(selectedFlow.nodes.map(toCanvasNode));
@@ -343,6 +362,10 @@ export function App() {
             <button type="submit">Create flow</button>
           </div>
         </form>
+        <div className="actions">
+          <button onClick={() => void provisionReferenceCatalog()} type="button">Provision reference catalog</button>
+          <p className="muted">Creates the five built-in Specialist Agents and the authorized-lab safety benchmark.</p>
+        </div>
       </section>
 
       <section className="panel" aria-labelledby="saved-flow-title">

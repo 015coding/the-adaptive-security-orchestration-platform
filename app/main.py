@@ -249,6 +249,16 @@ class EnablePluginRequest(BaseModel):
     pluginId: str
 
 
+class ReferenceCatalogResponse(BaseModel):
+    agentIds: list[str]
+    benchmarkFlowId: str
+
+
+class BenchmarkFlowResponse(BaseModel):
+    crystalFlowId: str
+    demonstrates: list[str]
+
+
 class CreateEvidenceRecordRequest(BaseModel):
     runId: str
     target: str = Field(min_length=1)
@@ -532,6 +542,17 @@ def _initialize_database(database_path: Path) -> None:
                 PRIMARY KEY (crystal_flow_id, version, plugin_id)
             );
 
+            CREATE TABLE IF NOT EXISTS reference_agents (
+                custom_agent_id TEXT PRIMARY KEY REFERENCES custom_agents(id),
+                plugin_id TEXT NOT NULL REFERENCES plugins(id),
+                catalog_position INTEGER NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS benchmark_flows (
+                crystal_flow_id TEXT PRIMARY KEY REFERENCES crystal_flows(id),
+                demonstrates_json TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS evidence_records (
                 id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL REFERENCES workflow_runs(id),
@@ -712,6 +733,109 @@ def create_app(
                 (crystal_flow_id, version),
             ).fetchall()
         }
+
+    def provision_reference_catalog(connection: sqlite3.Connection) -> ReferenceCatalogResponse:
+        reference_agents = [
+            ("Recon Agent", "reconnaissance", "network.read"),
+            ("Repository/Code Review Agent", "repository-review", "filesystem.read"),
+            ("Web/API Review Agent", "api-review", "network.read"),
+            ("Verification Agent", "verification", "network.read"),
+            ("Reporting Agent", "reporting", "evidence.read"),
+        ]
+        custom_agent_ids: list[str] = []
+        plugin_ids: list[str] = []
+        for position, (name, capability, permission) in enumerate(reference_agents, start=1):
+            reference_agent = connection.execute(
+                """
+                SELECT reference.custom_agent_id, reference.plugin_id
+                FROM reference_agents AS reference
+                WHERE reference.catalog_position = ?
+                """,
+                (position,),
+            ).fetchone()
+            if reference_agent is None:
+                plugin_id = uuid4().hex
+                custom_agent_id = uuid4().hex
+                manifest = PluginManifestRequest(
+                    capabilities=[capability],
+                    permissions=[permission],
+                    inputSchema={"type": "object"},
+                    outputSchema={"type": "object"},
+                )
+                connection.execute(
+                    """
+                    INSERT INTO plugins (
+                        id, name, version, builtin, checksum, plugin_status, integrity_verified, manifest_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plugin_id, f"Built-in {name}", "1.0.0", True, None, "approved", True, manifest.model_dump_json()),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO custom_agents (
+                        id, name, objective, instructions, inputs_json, capabilities_json,
+                        permissions_json, execution_limits_json, plugin_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        custom_agent_id,
+                        name,
+                        f"Perform bounded {capability} work in the active Crystal Flow.",
+                        "Use only the approved Plugin capability and return structured evidence.",
+                        "{}",
+                        json.dumps([capability]),
+                        json.dumps([permission]),
+                        ExecutionLimitsRequest(maxAttempts=2, maxRuntimeSeconds=120).model_dump_json(),
+                        plugin_id,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO reference_agents (custom_agent_id, plugin_id, catalog_position) VALUES (?, ?, ?)",
+                    (custom_agent_id, plugin_id, position),
+                )
+            else:
+                custom_agent_id = reference_agent["custom_agent_id"]
+                plugin_id = reference_agent["plugin_id"]
+            custom_agent_ids.append(custom_agent_id)
+            plugin_ids.append(plugin_id)
+
+        benchmark = connection.execute("SELECT crystal_flow_id FROM benchmark_flows LIMIT 1").fetchone()
+        if benchmark is None:
+            benchmark_flow_id = uuid4().hex
+            nodes = [
+                {"id": "recon", "type": "custom-agent", "label": "Recon Agent", "position": {"x": 0, "y": 0}, "config": {"customAgentId": custom_agent_ids[0], "branches": {"evidence": "repository", "timeout": "verification"}}},
+                {"id": "repository", "type": "custom-agent", "label": "Repository/Code Review Agent", "position": {"x": 220, "y": -100}, "config": {"customAgentId": custom_agent_ids[1], "branches": {"review-complete": "web-api"}}},
+                {"id": "web-api", "type": "custom-agent", "label": "Web/API Review Agent", "position": {"x": 440, "y": -100}, "config": {"customAgentId": custom_agent_ids[2], "branches": {"evidence": "approval"}}},
+                {"id": "approval", "type": "approval-gate", "label": "Owner Approval", "position": {"x": 660, "y": -100}, "config": {"branches": {"approved": "verification"}}},
+                {"id": "verification", "type": "custom-agent", "label": "Verification Agent", "position": {"x": 440, "y": 120}, "config": {"customAgentId": custom_agent_ids[3], "branches": {"verified": "reporting", "timeout": "repository"}, "boundedLoop": {"trigger": "timeout", "maxAttempts": 1}}},
+                {"id": "reporting", "type": "custom-agent", "label": "Reporting Agent", "position": {"x": 680, "y": 120}, "config": {"customAgentId": custom_agent_ids[4]}},
+            ]
+            edges = [
+                {"id": "recon-repository", "source": "recon", "target": "repository"},
+                {"id": "recon-verification", "source": "recon", "target": "verification"},
+                {"id": "repository-web-api", "source": "repository", "target": "web-api"},
+                {"id": "web-api-approval", "source": "web-api", "target": "approval"},
+                {"id": "approval-verification", "source": "approval", "target": "verification"},
+                {"id": "verification-repository", "source": "verification", "target": "repository"},
+                {"id": "verification-reporting", "source": "verification", "target": "reporting"},
+            ]
+            demonstrates = ["policy-blocking", "approval", "bounded-adaptation", "timeout-handling", "evidence-reconstruction"]
+            connection.execute("INSERT INTO crystal_flows (id, name, version) VALUES (?, ?, ?)", (benchmark_flow_id, "Lab safety benchmark", 1))
+            connection.execute(
+                "INSERT INTO crystal_flow_versions (crystal_flow_id, version, nodes_json, edges_json) VALUES (?, ?, ?, ?)",
+                (benchmark_flow_id, 1, json.dumps(nodes), json.dumps(edges)),
+            )
+            connection.executemany(
+                "INSERT INTO crystal_flow_plugins (crystal_flow_id, version, plugin_id) VALUES (?, ?, ?)",
+                [(benchmark_flow_id, 1, plugin_id) for plugin_id in plugin_ids],
+            )
+            connection.execute(
+                "INSERT INTO benchmark_flows (crystal_flow_id, demonstrates_json) VALUES (?, ?)",
+                (benchmark_flow_id, json.dumps(demonstrates)),
+            )
+        else:
+            benchmark_flow_id = benchmark["crystal_flow_id"]
+        return ReferenceCatalogResponse(agentIds=custom_agent_ids, benchmarkFlowId=benchmark_flow_id)
 
     def finding_response(connection: sqlite3.Connection, finding: sqlite3.Row) -> FindingResponse:
         node_ids = [
@@ -976,6 +1100,37 @@ def create_app(
         with _connect(resolved_database_path) as connection:
             agents = connection.execute("SELECT * FROM custom_agents ORDER BY rowid").fetchall()
         return [custom_agent_response(agent) for agent in agents]
+
+    @app.post("/api/reference-catalog", response_model=ReferenceCatalogResponse, status_code=status.HTTP_201_CREATED)
+    def provision_reference_agents() -> ReferenceCatalogResponse:
+        with _connect(resolved_database_path) as connection:
+            return provision_reference_catalog(connection)
+
+    @app.get("/api/reference-agents", response_model=list[CustomAgentResponse])
+    def list_reference_agents() -> list[CustomAgentResponse]:
+        with _connect(resolved_database_path) as connection:
+            agents = connection.execute(
+                """
+                SELECT agent.* FROM custom_agents AS agent
+                JOIN reference_agents AS reference ON reference.custom_agent_id = agent.id
+                ORDER BY reference.catalog_position
+                """
+            ).fetchall()
+        return [custom_agent_response(agent) for agent in agents]
+
+    @app.get("/api/benchmark-flows", response_model=list[BenchmarkFlowResponse])
+    def list_benchmark_flows() -> list[BenchmarkFlowResponse]:
+        with _connect(resolved_database_path) as connection:
+            benchmarks = connection.execute(
+                "SELECT crystal_flow_id, demonstrates_json FROM benchmark_flows ORDER BY rowid"
+            ).fetchall()
+        return [
+            BenchmarkFlowResponse(
+                crystalFlowId=benchmark["crystal_flow_id"],
+                demonstrates=json.loads(benchmark["demonstrates_json"]),
+            )
+            for benchmark in benchmarks
+        ]
 
     @app.post("/api/crystal-flows/{crystal_flow_id}/plugins", response_model=CrystalFlowResponse)
     def enable_plugin_in_crystal_flow(
