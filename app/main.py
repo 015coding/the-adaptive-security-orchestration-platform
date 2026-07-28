@@ -10,7 +10,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.policy import PolicyEngine, ScopePolicyInput
+from app.policy import PolicyEngine, PolicyOutcome, ScopePolicyInput
 from app.session_adapter import (
     CodexCli,
     CodexCliError,
@@ -146,6 +146,8 @@ class CreateScopeRequest(BaseModel):
 
 class ScopeResponse(BaseModel):
     id: str
+    version: int
+    previousScopeId: str | None
 
 
 class CreatePolicyDecisionRequest(BaseModel):
@@ -154,11 +156,26 @@ class CreatePolicyDecisionRequest(BaseModel):
     action: str = Field(min_length=1)
 
 
+class CreateReauthorizationRequest(BaseModel):
+    scopeId: str
+
+
 class PolicyDecisionResponse(BaseModel):
     id: str
     scopeId: str
     target: str
     action: str
+    status: str
+    reason: str
+
+
+class ApprovalResponse(BaseModel):
+    id: str
+    policyDecisionId: str
+    status: str
+
+
+class ActionResumeResponse(BaseModel):
     status: str
     reason: str
 
@@ -276,12 +293,40 @@ def _initialize_database(database_path: Path) -> None:
                 authorized_lab_environment INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS scope_versions (
+                scope_id TEXT PRIMARY KEY REFERENCES scopes(id),
+                root_scope_id TEXT NOT NULL REFERENCES scopes(id),
+                version INTEGER NOT NULL,
+                previous_scope_id TEXT REFERENCES scopes(id)
+            );
+
             CREATE TABLE IF NOT EXISTS policy_decisions (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL REFERENCES scopes(id),
                 target TEXT NOT NULL,
                 action TEXT NOT NULL,
                 decision_status TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_reauthorizations (
+                id TEXT PRIMARY KEY,
+                original_decision_id TEXT NOT NULL REFERENCES policy_decisions(id),
+                reauthorized_decision_id TEXT NOT NULL REFERENCES policy_decisions(id),
+                scope_id TEXT NOT NULL REFERENCES scopes(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                policy_decision_id TEXT NOT NULL UNIQUE REFERENCES policy_decisions(id),
+                approval_status TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS action_resumptions (
+                id TEXT PRIMARY KEY,
+                policy_decision_id TEXT NOT NULL REFERENCES policy_decisions(id),
+                approval_id TEXT REFERENCES approvals(id),
+                resume_status TEXT NOT NULL,
                 reason TEXT NOT NULL
             );
 
@@ -379,6 +424,41 @@ def create_app(
             unattended_execution=bool(scope["unattended_execution"]),
             authorized_lab_environment=bool(scope["authorized_lab_environment"]),
         )
+
+    def save_scope_version(
+        connection: sqlite3.Connection,
+        request: CreateScopeRequest,
+        *,
+        root_scope_id: str,
+        version: int,
+        previous_scope_id: str | None,
+        scope_id: str | None = None,
+    ) -> ScopeResponse:
+        scope_id = scope_id or uuid4().hex
+        connection.execute(
+            """
+            INSERT INTO scopes (
+                id, targets_json, workspace, allowed_actions_json, resource_limits_json,
+                starts_at, expires_at, unattended_execution, authorized_lab_environment
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scope_id,
+                json.dumps(request.targets),
+                request.workspace,
+                json.dumps(request.allowedActions),
+                request.resourceLimits.model_dump_json(),
+                request.startsAt.isoformat(),
+                request.expiresAt.isoformat(),
+                request.unattendedExecution,
+                request.authorizedLabEnvironment,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO scope_versions (scope_id, root_scope_id, version, previous_scope_id) VALUES (?, ?, ?, ?)",
+            (scope_id, root_scope_id, version, previous_scope_id),
+        )
+        return ScopeResponse(id=scope_id, version=version, previousScopeId=previous_scope_id)
 
     def crystal_flow_version(
         connection: sqlite3.Connection, crystal_flow_id: str, version: int
@@ -487,28 +567,39 @@ def create_app(
 
     @app.post("/api/scopes", response_model=ScopeResponse, status_code=status.HTTP_201_CREATED)
     def create_scope(request: CreateScopeRequest) -> ScopeResponse:
-        scope_id = uuid4().hex
         with _connect(resolved_database_path) as connection:
-            connection.execute(
-                """
-                INSERT INTO scopes (
-                    id, targets_json, workspace, allowed_actions_json, resource_limits_json,
-                    starts_at, expires_at, unattended_execution, authorized_lab_environment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    scope_id,
-                    json.dumps(request.targets),
-                    request.workspace,
-                    json.dumps(request.allowedActions),
-                    request.resourceLimits.model_dump_json(),
-                    request.startsAt.isoformat(),
-                    request.expiresAt.isoformat(),
-                    request.unattendedExecution,
-                    request.authorizedLabEnvironment,
-                ),
+            scope_id = uuid4().hex
+            return save_scope_version(
+                connection,
+                request,
+                root_scope_id=scope_id,
+                version=1,
+                previous_scope_id=None,
+                scope_id=scope_id,
             )
-        return ScopeResponse(id=scope_id)
+
+    @app.post("/api/scopes/{scope_id}/versions", response_model=ScopeResponse, status_code=status.HTTP_201_CREATED)
+    def create_scope_version(scope_id: str, request: CreateScopeRequest) -> ScopeResponse:
+        with _connect(resolved_database_path) as connection:
+            existing_scope = connection.execute("SELECT 1 FROM scopes WHERE id = ?", (scope_id,)).fetchone()
+            if existing_scope is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+            current_version = connection.execute(
+                "SELECT root_scope_id, version FROM scope_versions WHERE scope_id = ?", (scope_id,)
+            ).fetchone()
+            if current_version is None:
+                current_version = {"root_scope_id": scope_id, "version": 1}
+                connection.execute(
+                    "INSERT INTO scope_versions (scope_id, root_scope_id, version, previous_scope_id) VALUES (?, ?, ?, ?)",
+                    (scope_id, scope_id, 1, None),
+                )
+            return save_scope_version(
+                connection,
+                request,
+                root_scope_id=current_version["root_scope_id"],
+                version=current_version["version"] + 1,
+                previous_scope_id=scope_id,
+            )
 
     @app.post(
         "/api/policy-decisions",
@@ -567,6 +658,136 @@ def create_app(
             )
             for decision in decisions
         ]
+
+    @app.post(
+        "/api/policy-decisions/{policy_decision_id}/reauthorizations",
+        response_model=PolicyDecisionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def reauthorize_policy_denial(
+        policy_decision_id: str, request: CreateReauthorizationRequest
+    ) -> PolicyDecisionResponse:
+        with _connect(resolved_database_path) as connection:
+            original_decision = connection.execute(
+                "SELECT * FROM policy_decisions WHERE id = ?", (policy_decision_id,)
+            ).fetchone()
+            if original_decision is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy Decision not found")
+            if original_decision["decision_status"] != "deny":
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only a Policy Denial can be reauthorized")
+            scope = connection.execute("SELECT * FROM scopes WHERE id = ?", (request.scopeId,)).fetchone()
+            if scope is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
+            original_scope_version = connection.execute(
+                "SELECT root_scope_id, version FROM scope_versions WHERE scope_id = ?",
+                (original_decision["scope_id"],),
+            ).fetchone()
+            reauthorization_scope_version = connection.execute(
+                "SELECT root_scope_id, version FROM scope_versions WHERE scope_id = ?", (request.scopeId,)
+            ).fetchone()
+            if (
+                original_scope_version is None
+                or reauthorization_scope_version is None
+                or original_scope_version["root_scope_id"] != reauthorization_scope_version["root_scope_id"]
+                or reauthorization_scope_version["version"] <= original_scope_version["version"]
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Reauthorization requires a newer version of the original Scope",
+                )
+            outcome = policy_engine.evaluate(
+                scope_policy_input(scope), target=original_decision["target"], action=original_decision["action"]
+            )
+            reauthorized_decision_id = uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO policy_decisions (id, scope_id, target, action, decision_status, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    reauthorized_decision_id,
+                    request.scopeId,
+                    original_decision["target"],
+                    original_decision["action"],
+                    outcome.status,
+                    outcome.reason,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO policy_reauthorizations (
+                    id, original_decision_id, reauthorized_decision_id, scope_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (uuid4().hex, policy_decision_id, reauthorized_decision_id, request.scopeId),
+            )
+        return PolicyDecisionResponse(
+            id=reauthorized_decision_id,
+            scopeId=request.scopeId,
+            target=original_decision["target"],
+            action=original_decision["action"],
+            status=outcome.status,
+            reason=outcome.reason,
+        )
+
+    @app.post(
+        "/api/policy-decisions/{policy_decision_id}/approvals",
+        response_model=ApprovalResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def approve_required_action(policy_decision_id: str) -> ApprovalResponse:
+        approval_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            decision = connection.execute(
+                "SELECT decision_status FROM policy_decisions WHERE id = ?", (policy_decision_id,)
+            ).fetchone()
+            if decision is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy Decision not found")
+            if decision["decision_status"] != "approval-required":
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Policy Decision does not require Approval")
+            existing_approval = connection.execute(
+                "SELECT id, approval_status FROM approvals WHERE policy_decision_id = ?", (policy_decision_id,)
+            ).fetchone()
+            if existing_approval is not None:
+                return ApprovalResponse(
+                    id=existing_approval["id"],
+                    policyDecisionId=policy_decision_id,
+                    status=existing_approval["approval_status"],
+                )
+            connection.execute(
+                "INSERT INTO approvals (id, policy_decision_id, approval_status) VALUES (?, ?, ?)",
+                (approval_id, policy_decision_id, "approved"),
+            )
+        return ApprovalResponse(id=approval_id, policyDecisionId=policy_decision_id, status="approved")
+
+    @app.post("/api/policy-decisions/{policy_decision_id}/resume", response_model=ActionResumeResponse)
+    def resume_approved_action(policy_decision_id: str) -> ActionResumeResponse:
+        with _connect(resolved_database_path) as connection:
+            decision = connection.execute(
+                "SELECT * FROM policy_decisions WHERE id = ?", (policy_decision_id,)
+            ).fetchone()
+            if decision is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy Decision not found")
+            if decision["decision_status"] != "approval-required":
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Policy Decision does not require Approval")
+            approval = connection.execute(
+                "SELECT id FROM approvals WHERE policy_decision_id = ? AND approval_status = ?",
+                (policy_decision_id, "approved"),
+            ).fetchone()
+            if approval is None:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Owner Approval is required before resuming")
+            scope = connection.execute("SELECT * FROM scopes WHERE id = ?", (decision["scope_id"],)).fetchone()
+            assert scope is not None
+            outcome = policy_engine.evaluate(
+                scope_policy_input(scope), target=decision["target"], action=decision["action"]
+            )
+            if outcome.status == "approval-required":
+                outcome = PolicyOutcome("allow", "Owner Approval permits the action")
+            connection.execute(
+                "INSERT INTO action_resumptions (id, policy_decision_id, approval_id, resume_status, reason) VALUES (?, ?, ?, ?, ?)",
+                (uuid4().hex, policy_decision_id, approval["id"], outcome.status, outcome.reason),
+            )
+        return ActionResumeResponse(status=outcome.status, reason=outcome.reason)
 
     @app.post("/api/vm-tasks", response_model=RunLogBundleResponse, status_code=status.HTTP_201_CREATED)
     def run_vm_task(request: CreateVmTaskRequest) -> RunLogBundleResponse:

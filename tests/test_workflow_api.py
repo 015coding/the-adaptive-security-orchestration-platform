@@ -605,6 +605,99 @@ def test_policy_engine_requires_approval_for_a_permitted_exploitation_attempt(tm
     assert decision.json()["reason"] == "Exploitation Attempt requires Approval"
 
 
+def test_required_action_resumes_only_after_owner_approval(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    now = datetime.now(UTC)
+
+    with TestClient(app) as client:
+        scope = client.post(
+            "/api/scopes",
+            json={
+                "targets": ["https://lab.example.test"],
+                "workspace": "/srv/adaptive-security/runs/run-1",
+                "allowedActions": ["exploitation-attempt"],
+                "resourceLimits": {
+                    "maxRequestsPerSecond": 1,
+                    "maxConcurrentTasks": 1,
+                    "maxRuntimeSeconds": 60,
+                },
+                "startsAt": now.isoformat(),
+                "expiresAt": (now + timedelta(hours=1)).isoformat(),
+                "unattendedExecution": False,
+                "authorizedLabEnvironment": True,
+            },
+        ).json()
+        decision = client.post(
+            "/api/policy-decisions",
+            json={
+                "scopeId": scope["id"],
+                "target": "https://lab.example.test",
+                "action": "exploitation-attempt",
+            },
+        ).json()
+        paused = client.post(f"/api/policy-decisions/{decision['id']}/resume")
+        approval = client.post(f"/api/policy-decisions/{decision['id']}/approvals")
+        resumed = client.post(f"/api/policy-decisions/{decision['id']}/resume")
+
+    assert paused.status_code == 409
+    assert approval.status_code == 201
+    assert approval.json()["status"] == "approved"
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "allow"
+    assert resumed.json()["reason"] == "Owner Approval permits the action"
+
+
+def test_reauthorization_uses_a_new_scope_version_without_overriding_a_policy_denial(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    now = datetime.now(UTC)
+    initial_scope = {
+        "targets": ["https://lab.example.test"],
+        "workspace": "/srv/adaptive-security/runs/run-1",
+        "allowedActions": ["exploitation-attempt"],
+        "resourceLimits": {
+            "maxRequestsPerSecond": 1,
+            "maxConcurrentTasks": 1,
+            "maxRuntimeSeconds": 60,
+        },
+        "startsAt": now.isoformat(),
+        "expiresAt": (now + timedelta(hours=1)).isoformat(),
+        "unattendedExecution": False,
+        "authorizedLabEnvironment": False,
+    }
+    revised_scope = {**initial_scope, "unattendedExecution": True, "authorizedLabEnvironment": True}
+
+    with TestClient(app) as client:
+        scope = client.post("/api/scopes", json=initial_scope).json()
+        denied = client.post(
+            "/api/policy-decisions",
+            json={
+                "scopeId": scope["id"],
+                "target": "https://lab.example.test",
+                "action": "exploitation-attempt",
+            },
+        ).json()
+        unrelated_scope = client.post("/api/scopes", json=revised_scope).json()
+        rejected = client.post(
+            f"/api/policy-decisions/{denied['id']}/reauthorizations",
+            json={"scopeId": unrelated_scope["id"]},
+        )
+        version = client.post(f"/api/scopes/{scope['id']}/versions", json=revised_scope)
+        reauthorized = client.post(
+            f"/api/policy-decisions/{denied['id']}/reauthorizations",
+            json={"scopeId": version.json()["id"]},
+        )
+        original_decisions = client.get(f"/api/scopes/{scope['id']}/policy-decisions")
+
+    assert denied["status"] == "deny"
+    assert rejected.status_code == 409
+    assert version.status_code == 201
+    assert version.json()["version"] == 2
+    assert version.json()["previousScopeId"] == scope["id"]
+    assert reauthorized.status_code == 201
+    assert reauthorized.json()["status"] == "allow"
+    assert original_decisions.json() == [denied]
+
+
 def test_policy_engine_denies_actions_after_the_scope_window_expires(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
     now = datetime.now(UTC)
