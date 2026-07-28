@@ -151,7 +151,23 @@ const nodeTypes = { security: SecurityNode };
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
   if (!response.ok) {
-    throw new Error(`Request failed with ${response.status}`);
+    const responseText = await response.text();
+    let detail = responseText;
+    try {
+      const payload = JSON.parse(responseText) as { detail?: unknown };
+      if (typeof payload.detail === "string") {
+        detail = payload.detail;
+      } else if (Array.isArray(payload.detail)) {
+        detail = payload.detail.map((item) => (
+          typeof item === "object" && item !== null && "msg" in item
+            ? String(item.msg)
+            : JSON.stringify(item)
+        )).join("; ");
+      }
+    } catch {
+      // Keep the raw response text when the server did not return JSON.
+    }
+    throw new Error(detail ? `Request failed with ${response.status}: ${detail}` : `Request failed with ${response.status}`);
   }
   if (response.status === 204) {
     return undefined as T;
