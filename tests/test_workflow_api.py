@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from fastapi.testclient import TestClient
 
@@ -126,7 +127,95 @@ def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
         assert original.status_code == 200
         assert original.json()["version"] == 1
         assert original.json()["nodes"] == []
-        assert original.json()["edges"] == []
+    assert original.json()["edges"] == []
+
+
+def test_finding_reconstructs_run_provenance_and_keeps_sensitive_vm_evidence_masked(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    raw_summary = "token=super-secret"
+    now = datetime.now(UTC)
+
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Evidence flow"}).json()
+        client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [{"id": "recon", "type": "recon-agent", "label": "Recon", "position": {"x": 0, "y": 0}, "config": {}}],
+                "edges": [],
+            },
+        )
+        run = client.post(f"/api/crystal-flows/{flow['id']}/runs").json()
+        client.post(
+            f"/api/runs/{run['id']}/node-results",
+            json={"nodeId": "recon", "trigger": "evidence", "result": {"endpoint": "/admin"}},
+        )
+        evidence = client.post(
+            "/api/evidence-records",
+            json={
+                "runId": run["id"],
+                "target": "https://lab.example.test",
+                "summary": raw_summary,
+                "sha256": sha256(raw_summary.encode()).hexdigest(),
+                "storage": "vm-resident",
+                "vmResidentPath": "artifacts/memory.raw",
+                "availability": "available",
+                "sensitive": True,
+            },
+        )
+        scope = client.post(
+            "/api/scopes",
+            json={
+                "targets": ["https://lab.example.test"],
+                "workspace": "/srv/adaptive-security/runs/evidence",
+                "allowedActions": ["reconnaissance"],
+                "resourceLimits": {"maxRequestsPerSecond": 1, "maxConcurrentTasks": 1, "maxRuntimeSeconds": 60},
+                "startsAt": now.isoformat(),
+                "expiresAt": (now + timedelta(hours=1)).isoformat(),
+                "unattendedExecution": False,
+                "authorizedLabEnvironment": True,
+            },
+        ).json()
+        tool_call = client.post(
+            "/api/vm-tasks",
+            json={
+                "scopeId": scope["id"],
+                "environment": "kali",
+                "target": "https://lab.example.test",
+                "action": "reconnaissance",
+                "command": ["echo", "evidence"],
+                "artifactReferences": ["artifacts/recon.json"],
+            },
+        ).json()
+        policy_decision = client.post(
+            "/api/policy-decisions",
+            json={"scopeId": scope["id"], "target": "https://lab.example.test", "action": "reconnaissance"},
+        ).json()
+        finding = client.post(
+            "/api/findings",
+            json={
+                "title": "Administrative endpoint exposed",
+                "target": "https://lab.example.test",
+                "runId": run["id"],
+                "evidenceRecordIds": [evidence.json()["id"]],
+                "runLogBundleIds": [tool_call["id"]],
+                "policyDecisionIds": [policy_decision["id"]],
+            },
+        )
+        masked = client.get(f"/api/evidence-records/{evidence.json()['id']}")
+        revealed = client.post(f"/api/evidence-records/{evidence.json()['id']}/reveal")
+        access_events = client.get(f"/api/evidence-records/{evidence.json()['id']}/access-events")
+
+    assert evidence.status_code == 201
+    assert finding.status_code == 201
+    assert finding.json()["provenance"]["nodeIds"] == ["recon"]
+    assert finding.json()["provenance"]["agentMessages"] == [{"sourceNodeId": "recon", "trigger": "evidence", "message": {"endpoint": "/admin"}}]
+    assert finding.json()["provenance"]["toolCalls"][0]["id"] == tool_call["id"]
+    assert finding.json()["provenance"]["policyDecisions"][0]["id"] == policy_decision["id"]
+    assert finding.json()["provenance"]["evidenceArtifacts"][0]["sha256"] == sha256(raw_summary.encode()).hexdigest()
+    assert masked.json()["summary"] == "[Sensitive Evidence masked]"
+    assert masked.json()["vmResidentPath"] == "artifacts/memory.raw"
+    assert revealed.json()["summary"] == raw_summary
+    assert access_events.json() == [{"eventType": "evidence.revealed"}]
 
 
 def test_owner_cannot_save_a_branch_to_a_missing_workflow_node(tmp_path):

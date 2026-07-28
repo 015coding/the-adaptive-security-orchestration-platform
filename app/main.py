@@ -5,8 +5,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import json
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
+from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -247,6 +249,90 @@ class EnablePluginRequest(BaseModel):
     pluginId: str
 
 
+class CreateEvidenceRecordRequest(BaseModel):
+    runId: str
+    target: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    sha256: str = Field(pattern="^[A-Fa-f0-9]{64}$")
+    storage: Literal["host", "vm-resident"]
+    vmResidentPath: str | None = None
+    availability: Literal["available", "unavailable"]
+    sensitive: bool
+
+    @model_validator(mode="after")
+    def vm_resident_evidence_requires_a_safe_path(self) -> "CreateEvidenceRecordRequest":
+        if self.storage == "vm-resident":
+            if not self.vmResidentPath or self.vmResidentPath.startswith("/") or ".." in Path(self.vmResidentPath).parts:
+                raise ValueError("VM-Resident Artifacts require a relative Run Workspace path")
+        return self
+
+
+class EvidenceRecordResponse(BaseModel):
+    id: str
+    runId: str
+    target: str
+    summary: str
+    sha256: str
+    storage: str
+    vmResidentPath: str | None
+    availability: str
+    sensitive: bool
+
+
+class EvidenceAccessEventResponse(BaseModel):
+    eventType: str
+
+
+class CreateFindingRequest(BaseModel):
+    title: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    runId: str
+    evidenceRecordIds: list[str] = Field(min_length=1)
+    runLogBundleIds: list[str] = Field(default_factory=list)
+    policyDecisionIds: list[str] = Field(default_factory=list)
+
+    @field_validator("evidenceRecordIds", "runLogBundleIds", "policyDecisionIds")
+    @classmethod
+    def provenance_references_must_be_unique(cls, references: list[str]) -> list[str]:
+        if len(set(references)) != len(references):
+            raise ValueError("Finding provenance references must be unique")
+        return references
+
+
+class AgentMessageProvenanceResponse(BaseModel):
+    sourceNodeId: str
+    trigger: str
+    message: dict[str, object]
+
+
+class ToolCallProvenanceResponse(BaseModel):
+    id: str
+    scopeId: str
+    environment: str
+    workspace: str
+    status: str
+    exitCode: int | None
+    stdout: str
+    stderr: str
+    artifactReferences: list[str]
+
+
+class FindingProvenanceResponse(BaseModel):
+    nodeIds: list[str]
+    agentMessages: list[AgentMessageProvenanceResponse]
+    toolCalls: list[ToolCallProvenanceResponse]
+    policyDecisions: list[PolicyDecisionResponse]
+    evidenceArtifacts: list[EvidenceRecordResponse]
+
+
+class FindingResponse(BaseModel):
+    id: str
+    title: str
+    target: str
+    runId: str
+    provenance: FindingProvenanceResponse
+
+
 class CreateVmTaskRequest(BaseModel):
     scopeId: str
     environment: str = Field(pattern="^(kali|debian)$")
@@ -314,6 +400,18 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def _evidence_cipher(database_path: Path) -> Fernet:
+    key_path = database_path.with_suffix(".evidence.key")
+    if key_path.exists():
+        key = key_path.read_bytes()
+    else:
+        key = Fernet.generate_key()
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_bytes(key)
+        key_path.chmod(0o600)
+    return Fernet(key)
 
 
 def _initialize_database(database_path: Path) -> None:
@@ -427,6 +525,49 @@ def _initialize_database(database_path: Path) -> None:
                 PRIMARY KEY (crystal_flow_id, version, plugin_id)
             );
 
+            CREATE TABLE IF NOT EXISTS evidence_records (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES workflow_runs(id),
+                target TEXT NOT NULL,
+                encrypted_summary TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                storage TEXT NOT NULL,
+                vm_resident_path TEXT,
+                availability TEXT NOT NULL,
+                sensitive INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence_access_events (
+                id TEXT PRIMARY KEY,
+                evidence_record_id TEXT NOT NULL REFERENCES evidence_records(id),
+                event_type TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS findings (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                target TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES workflow_runs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS finding_evidence_records (
+                finding_id TEXT NOT NULL REFERENCES findings(id),
+                evidence_record_id TEXT NOT NULL REFERENCES evidence_records(id),
+                PRIMARY KEY (finding_id, evidence_record_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS finding_run_log_bundles (
+                finding_id TEXT NOT NULL REFERENCES findings(id),
+                run_log_bundle_id TEXT NOT NULL REFERENCES run_log_bundles(id),
+                PRIMARY KEY (finding_id, run_log_bundle_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS finding_policy_decisions (
+                finding_id TEXT NOT NULL REFERENCES findings(id),
+                policy_decision_id TEXT NOT NULL REFERENCES policy_decisions(id),
+                PRIMARY KEY (finding_id, policy_decision_id)
+            );
+
             CREATE TABLE IF NOT EXISTS run_log_bundles (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL REFERENCES scopes(id),
@@ -489,6 +630,25 @@ def create_app(
     policy_engine = PolicyEngine()
     configured_vm_runner = vm_runner or SshVmRunner.from_environment()
     session_adapter = SessionAdapter(codex_cli or SubprocessCodexCli())
+    evidence_cipher = _evidence_cipher(resolved_database_path)
+
+    def evidence_record_response(
+        evidence_record: sqlite3.Row, *, reveal_sensitive_summary: bool = False
+    ) -> EvidenceRecordResponse:
+        summary = evidence_cipher.decrypt(evidence_record["encrypted_summary"].encode()).decode()
+        if evidence_record["sensitive"] and not reveal_sensitive_summary:
+            summary = "[Sensitive Evidence masked]"
+        return EvidenceRecordResponse(
+            id=evidence_record["id"],
+            runId=evidence_record["run_id"],
+            target=evidence_record["target"],
+            summary=summary,
+            sha256=evidence_record["sha256"],
+            storage=evidence_record["storage"],
+            vmResidentPath=evidence_record["vm_resident_path"],
+            availability=evidence_record["availability"],
+            sensitive=bool(evidence_record["sensitive"]),
+        )
 
     def current_crystal_flow(connection: sqlite3.Connection, crystal_flow_id: str) -> CrystalFlowResponse | None:
         flow = connection.execute(
@@ -545,6 +705,99 @@ def create_app(
                 (crystal_flow_id, version),
             ).fetchall()
         }
+
+    def finding_response(connection: sqlite3.Connection, finding: sqlite3.Row) -> FindingResponse:
+        node_ids = [
+            row["node_id"]
+            for row in connection.execute(
+                "SELECT node_id FROM node_statuses WHERE run_id = ? ORDER BY rowid", (finding["run_id"],)
+            ).fetchall()
+        ]
+        agent_messages = [
+            AgentMessageProvenanceResponse(
+                sourceNodeId=row["source_node_id"],
+                trigger=row["trigger"],
+                message=json.loads(row["message_json"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT source_node_id, trigger, message_json
+                FROM agent_messages
+                WHERE run_id = ?
+                ORDER BY rowid
+                """,
+                (finding["run_id"],),
+            ).fetchall()
+        ]
+        evidence_artifacts = [
+            evidence_record_response(row)
+            for row in connection.execute(
+                """
+                SELECT evidence.* FROM evidence_records AS evidence
+                JOIN finding_evidence_records AS finding_evidence
+                    ON finding_evidence.evidence_record_id = evidence.id
+                WHERE finding_evidence.finding_id = ?
+                ORDER BY evidence.rowid
+                """,
+                (finding["id"],),
+            ).fetchall()
+        ]
+        tool_calls = [
+            ToolCallProvenanceResponse(
+                id=row["id"],
+                scopeId=row["scope_id"],
+                environment=row["environment"],
+                workspace=row["workspace"],
+                status=row["task_status"],
+                exitCode=row["exit_code"],
+                stdout=row["stdout"],
+                stderr=row["stderr"],
+                artifactReferences=json.loads(row["artifact_references_json"]),
+            )
+            for row in connection.execute(
+                """
+                SELECT run_log_bundle.* FROM run_log_bundles AS run_log_bundle
+                JOIN finding_run_log_bundles AS finding_tool_call
+                    ON finding_tool_call.run_log_bundle_id = run_log_bundle.id
+                WHERE finding_tool_call.finding_id = ?
+                ORDER BY run_log_bundle.rowid
+                """,
+                (finding["id"],),
+            ).fetchall()
+        ]
+        policy_decisions = [
+            PolicyDecisionResponse(
+                id=row["id"],
+                scopeId=row["scope_id"],
+                target=row["target"],
+                action=row["action"],
+                status=row["decision_status"],
+                reason=row["reason"],
+            )
+            for row in connection.execute(
+                """
+                SELECT policy_decision.* FROM policy_decisions AS policy_decision
+                JOIN finding_policy_decisions AS finding_policy_decision
+                    ON finding_policy_decision.policy_decision_id = policy_decision.id
+                WHERE finding_policy_decision.finding_id = ?
+                ORDER BY policy_decision.rowid
+                """,
+                (finding["id"],),
+            ).fetchall()
+        ]
+        return FindingResponse(
+            id=finding["id"],
+            title=finding["title"],
+            target=finding["target"],
+            runId=finding["run_id"],
+            provenance=FindingProvenanceResponse(
+                nodeIds=node_ids,
+                agentMessages=agent_messages,
+                toolCalls=tool_calls,
+                policyDecisions=policy_decisions,
+                evidenceArtifacts=evidence_artifacts,
+            ),
+        )
 
     def scope_policy_input(scope: sqlite3.Row) -> ScopePolicyInput:
         return ScopePolicyInput(
@@ -1078,6 +1331,135 @@ def create_app(
                 (uuid4().hex, policy_decision_id, approval["id"], outcome.status, outcome.reason),
             )
         return ActionResumeResponse(status=outcome.status, reason=outcome.reason)
+
+    @app.post("/api/evidence-records", response_model=EvidenceRecordResponse, status_code=status.HTTP_201_CREATED)
+    def create_evidence_record(request: CreateEvidenceRecordRequest) -> EvidenceRecordResponse:
+        evidence_record_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute("SELECT 1 FROM workflow_runs WHERE id = ?", (request.runId,)).fetchone()
+            if run is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+            connection.execute(
+                """
+                INSERT INTO evidence_records (
+                    id, run_id, target, encrypted_summary, sha256, storage, vm_resident_path, availability, sensitive
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_record_id,
+                    request.runId,
+                    request.target,
+                    evidence_cipher.encrypt(request.summary.encode()).decode(),
+                    request.sha256,
+                    request.storage,
+                    request.vmResidentPath,
+                    request.availability,
+                    request.sensitive,
+                ),
+            )
+            evidence_record = connection.execute(
+                "SELECT * FROM evidence_records WHERE id = ?", (evidence_record_id,)
+            ).fetchone()
+        assert evidence_record is not None
+        return evidence_record_response(evidence_record)
+
+    @app.get("/api/evidence-records/{evidence_record_id}", response_model=EvidenceRecordResponse)
+    def get_evidence_record(evidence_record_id: str) -> EvidenceRecordResponse:
+        with _connect(resolved_database_path) as connection:
+            evidence_record = connection.execute(
+                "SELECT * FROM evidence_records WHERE id = ?", (evidence_record_id,)
+            ).fetchone()
+        if evidence_record is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence Record not found")
+        return evidence_record_response(evidence_record)
+
+    @app.post("/api/evidence-records/{evidence_record_id}/reveal", response_model=EvidenceRecordResponse)
+    def reveal_sensitive_evidence(evidence_record_id: str) -> EvidenceRecordResponse:
+        with _connect(resolved_database_path) as connection:
+            evidence_record = connection.execute(
+                "SELECT * FROM evidence_records WHERE id = ?", (evidence_record_id,)
+            ).fetchone()
+            if evidence_record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence Record not found")
+            if evidence_record["sensitive"]:
+                connection.execute(
+                    "INSERT INTO evidence_access_events (id, evidence_record_id, event_type) VALUES (?, ?, ?)",
+                    (uuid4().hex, evidence_record_id, "evidence.revealed"),
+                )
+        return evidence_record_response(evidence_record, reveal_sensitive_summary=True)
+
+    @app.get(
+        "/api/evidence-records/{evidence_record_id}/access-events",
+        response_model=list[EvidenceAccessEventResponse],
+    )
+    def list_evidence_access_events(evidence_record_id: str) -> list[EvidenceAccessEventResponse]:
+        with _connect(resolved_database_path) as connection:
+            events = connection.execute(
+                "SELECT event_type FROM evidence_access_events WHERE evidence_record_id = ? ORDER BY rowid",
+                (evidence_record_id,),
+            ).fetchall()
+        return [EvidenceAccessEventResponse(eventType=event["event_type"]) for event in events]
+
+    @app.post("/api/findings", response_model=FindingResponse, status_code=status.HTTP_201_CREATED)
+    def create_finding(request: CreateFindingRequest) -> FindingResponse:
+        finding_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            run = connection.execute("SELECT 1 FROM workflow_runs WHERE id = ?", (request.runId,)).fetchone()
+            if run is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+            evidence_records = connection.execute(
+                "SELECT id FROM evidence_records WHERE run_id = ? AND id IN ({})".format(
+                    ", ".join("?" for _ in request.evidenceRecordIds)
+                ),
+                (request.runId, *request.evidenceRecordIds),
+            ).fetchall()
+            if {record["id"] for record in evidence_records} != set(request.evidenceRecordIds):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Finding Evidence Records must belong to the Workflow Run")
+            if request.runLogBundleIds:
+                run_log_bundles = connection.execute(
+                    "SELECT id FROM run_log_bundles WHERE id IN ({})".format(
+                        ", ".join("?" for _ in request.runLogBundleIds)
+                    ),
+                    request.runLogBundleIds,
+                ).fetchall()
+                if {bundle["id"] for bundle in run_log_bundles} != set(request.runLogBundleIds):
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Finding Tool Calls must exist")
+            if request.policyDecisionIds:
+                policy_decisions = connection.execute(
+                    "SELECT id FROM policy_decisions WHERE id IN ({})".format(
+                        ", ".join("?" for _ in request.policyDecisionIds)
+                    ),
+                    request.policyDecisionIds,
+                ).fetchall()
+                if {decision["id"] for decision in policy_decisions} != set(request.policyDecisionIds):
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Finding Policy Decisions must exist")
+            connection.execute(
+                "INSERT INTO findings (id, title, target, run_id) VALUES (?, ?, ?, ?)",
+                (finding_id, request.title, request.target, request.runId),
+            )
+            connection.executemany(
+                "INSERT INTO finding_evidence_records (finding_id, evidence_record_id) VALUES (?, ?)",
+                [(finding_id, evidence_record_id) for evidence_record_id in request.evidenceRecordIds],
+            )
+            connection.executemany(
+                "INSERT INTO finding_run_log_bundles (finding_id, run_log_bundle_id) VALUES (?, ?)",
+                [(finding_id, run_log_bundle_id) for run_log_bundle_id in request.runLogBundleIds],
+            )
+            connection.executemany(
+                "INSERT INTO finding_policy_decisions (finding_id, policy_decision_id) VALUES (?, ?)",
+                [(finding_id, policy_decision_id) for policy_decision_id in request.policyDecisionIds],
+            )
+            finding = connection.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+            assert finding is not None
+            return finding_response(connection, finding)
+
+    @app.get("/api/findings/{finding_id}", response_model=FindingResponse)
+    def get_finding(finding_id: str) -> FindingResponse:
+        with _connect(resolved_database_path) as connection:
+            finding = connection.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+            if finding is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Finding not found")
+            return finding_response(connection, finding)
 
     @app.post("/api/vm-tasks", response_model=RunLogBundleResponse, status_code=status.HTTP_201_CREATED)
     def run_vm_task(request: CreateVmTaskRequest) -> RunLogBundleResponse:
