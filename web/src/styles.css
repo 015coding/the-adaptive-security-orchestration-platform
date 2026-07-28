@@ -31,11 +31,11 @@ body {
     var(--bg);
 }
 
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 
 button { cursor: pointer; }
 
-button:focus-visible, input:focus-visible {
+button:focus-visible, input:focus-visible, select:focus-visible {
   outline: 2px solid var(--cyan);
   outline-offset: 2px;
 }
@@ -145,6 +145,18 @@ input {
 input::placeholder { color: #506678; }
 input:hover { border-color: var(--border-bright); }
 input:focus { border-color: var(--cyan); }
+
+select {
+  width: 100%;
+  padding: 9px 28px 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: #08131c;
+  font-size: 10px;
+}
+
+select:hover, select:focus { border-color: var(--cyan); }
 
 .icon-button {
   flex: 0 0 34px;
@@ -635,6 +647,16 @@ input:focus { border-color: var(--cyan); }
 .inspector-content > input { width: 100%; background: #08131c; }
 .field-help { margin: 6px 0 0; color: #587184; font-size: 8px; line-height: 1.5; }
 .field-help code { padding: 2px 4px; border-radius: 3px; color: var(--cyan); background: rgba(52, 211, 199, 0.08); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.execution-profile {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid #203949;
+  border-radius: 6px;
+  background: #0b1924;
+}
+.execution-profile-heading { display: flex; align-items: center; justify-content: space-between; color: #698397; font-size: 7px; font-weight: 850; letter-spacing: 0.11em; }
+.execution-profile-heading b { color: var(--cyan); font-size: 6px; }
+.execution-profile label:first-of-type { margin-top: 12px; }
 .delete-item-button {
   width: 100%;
   margin-top: 16px;
@@ -778,6 +800,7 @@ input:focus { border-color: var(--cyan); }
 [data-theme="light"] .selected-identity,
 [data-theme="light"] .inspection-list { border-color: #d9e3e8; }
 [data-theme="light"] input,
+[data-theme="light"] select,
 [data-theme="light"] .inspector-content > input { color: #203445; background: #fff; }
 [data-theme="light"] .flow-list-item.is-current { color: #173a48; background: #e7f1f2; border-color: #bdd8db; }
 [data-theme="light"] .owner-chip,
@@ -829,6 +852,7 @@ input:focus { border-color: var(--cyan); }
 [data-theme="light"] .dock-header button { color: #496a7a; background: #fff; }
 [data-theme="light"] .error-toast { color: #973b42; background: #fff2f2; }
 [data-theme="light"] .field-help code { color: #076c69; }
+[data-theme="light"] .execution-profile { background: #f4f8f9; border-color: #ccdde3; }
 [data-theme="light"] .run-record strong,
 [data-theme="light"] .page-finding-list strong,
 [data-theme="light"] .policy-grid h3 { color: #2d4a5a; }

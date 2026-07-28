@@ -548,6 +548,8 @@ def test_ai_node_uses_the_session_adapter_and_records_output_timeout_and_resourc
                 "nodeId": "recon-1",
                 "task": "Identify the API surface",
                 "input": {"target": "https://lab.example.test"},
+                "model": "gpt-5.6-sol",
+                "reasoningEffort": "high",
                 "timeoutSeconds": 30,
                 "maxResourceUnits": 10,
             },
@@ -560,6 +562,8 @@ def test_ai_node_uses_the_session_adapter_and_records_output_timeout_and_resourc
             "nodeId": "recon-1",
             "status": "completed",
             "output": {"summary": "API surface identified", "nextBranch": "verify"},
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "high",
             "timeoutSeconds": 30,
             "resourceUnits": 4,
         }
@@ -570,6 +574,8 @@ def test_ai_node_uses_the_session_adapter_and_records_output_timeout_and_resourc
                     "nodeId": "recon-1",
                     "task": "Identify the API surface",
                     "input": {"target": "https://lab.example.test"},
+                    "model": "gpt-5.6-sol",
+                    "reasoningEffort": "high",
                 },
                 "timeout_seconds": 30,
             }

@@ -375,6 +375,13 @@ class CreateAiNodeRequest(BaseModel):
     nodeId: str = Field(min_length=1)
     task: str = Field(min_length=1)
     input: dict[str, object]
+    model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    reasoningEffort: Literal["low", "medium", "high", "xhigh"] = "medium"
     timeoutSeconds: int = Field(ge=1)
     maxResourceUnits: int = Field(ge=1)
 
@@ -385,6 +392,8 @@ class AiNodeInvocationResponse(BaseModel):
     nodeId: str
     status: str
     output: dict[str, object]
+    model: str | None
+    reasoningEffort: str
     timeoutSeconds: int
     resourceUnits: int
 
@@ -614,6 +623,8 @@ def _initialize_database(database_path: Path) -> None:
                 node_id TEXT NOT NULL,
                 invocation_status TEXT NOT NULL,
                 output_json TEXT NOT NULL,
+                model TEXT,
+                reasoning_effort TEXT NOT NULL DEFAULT 'medium',
                 timeout_seconds INTEGER NOT NULL,
                 resource_units INTEGER NOT NULL
             );
@@ -640,6 +651,17 @@ def _initialize_database(database_path: Path) -> None:
             SELECT id, 1, '[]', '[]' FROM crystal_flows;
             """
         )
+        invocation_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(ai_node_invocations)").fetchall()
+        }
+        if "model" not in invocation_columns:
+            connection.execute("ALTER TABLE ai_node_invocations ADD COLUMN model TEXT")
+        if "reasoning_effort" not in invocation_columns:
+            connection.execute(
+                "ALTER TABLE ai_node_invocations "
+                "ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"
+            )
 
 
 def create_app(
@@ -1835,6 +1857,8 @@ def create_app(
                 "nodeId": request.nodeId,
                 "task": request.task,
                 "input": request.input,
+                "model": request.model,
+                "reasoningEffort": request.reasoningEffort,
             }
             try:
                 result = session_adapter.execute(session_request, request.timeoutSeconds)
@@ -1855,8 +1879,9 @@ def create_app(
             connection.execute(
                 """
                 INSERT INTO ai_node_invocations (
-                    id, run_id, node_id, invocation_status, output_json, timeout_seconds, resource_units
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, run_id, node_id, invocation_status, output_json, model,
+                    reasoning_effort, timeout_seconds, resource_units
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     invocation_id,
@@ -1864,6 +1889,8 @@ def create_app(
                     request.nodeId,
                     invocation_status,
                     json.dumps(output),
+                    request.model,
+                    request.reasoningEffort,
                     request.timeoutSeconds,
                     resource_units,
                 ),
@@ -1881,6 +1908,8 @@ def create_app(
             nodeId=request.nodeId,
             status=invocation_status,
             output=output,
+            model=request.model,
+            reasoningEffort=request.reasoningEffort,
             timeoutSeconds=request.timeoutSeconds,
             resourceUnits=resource_units,
         )
@@ -1890,7 +1919,8 @@ def create_app(
         with _connect(resolved_database_path) as connection:
             invocations = connection.execute(
                 """
-                SELECT id, run_id, node_id, invocation_status, output_json, timeout_seconds, resource_units
+                SELECT id, run_id, node_id, invocation_status, output_json, model,
+                       reasoning_effort, timeout_seconds, resource_units
                 FROM ai_node_invocations
                 WHERE run_id = ?
                 ORDER BY rowid
@@ -1904,6 +1934,8 @@ def create_app(
                 nodeId=invocation["node_id"],
                 status=invocation["invocation_status"],
                 output=json.loads(invocation["output_json"]),
+                model=invocation["model"],
+                reasoningEffort=invocation["reasoning_effort"],
                 timeoutSeconds=invocation["timeout_seconds"],
                 resourceUnits=invocation["resource_units"],
             )

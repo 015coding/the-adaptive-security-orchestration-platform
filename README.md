@@ -41,6 +41,17 @@ The remote `assessment-runner` account must be restricted by the VM configuratio
 
 Set `CODEX_SESSION_COMMAND` to a local bridge client for the one currently running Codex CLI session. The bridge reads one structured JSON request from standard input and returns JSON with `output` and `resourceUnits` fields. The API serializes all AI-node requests through that bridge and records their result, timeout, and resource usage.
 
+Each AI-capable Workflow Node can select a Codex model and reasoning effort.
+The bridge request contains `model` and `reasoningEffort`; map these to the
+Codex app-server `turn/start` fields `model` and `effort`. Selecting “Session
+default” sends a null model so the active Codex configuration remains in
+control. The selected values are also stored with the AI Node Invocation for
+audit review.
+
+Current picker choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and
+`gpt-5.6-luna`. Availability still depends on the models accessible to the
+Owner's authenticated Codex CLI session.
+
 ## Verify
 
 ```sh

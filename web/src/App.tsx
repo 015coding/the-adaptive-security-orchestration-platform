@@ -69,6 +69,8 @@ type AiNodeInvocation = {
   nodeId: string;
   status: string;
   output: Record<string, unknown>;
+  model: string | null;
+  reasoningEffort: string;
   timeoutSeconds: number;
   resourceUnits: number;
 };
@@ -122,7 +124,7 @@ function SecurityNode({ data, selected }: NodeProps<WorkflowNode>) {
         <span className="node-live-dot" aria-label={data.status ?? "idle"} />
       </div>
       <strong>{data.label}</strong>
-      <small>{data.status ?? "Ready"}</small>
+      <small>{data.status ?? (typeof data.config.model === "string" ? data.config.model : "Session default")}</small>
       <Handle type="source" position={Position.Right} />
     </div>
   );
@@ -373,6 +375,20 @@ export function App() {
         ? { ...node, data: { ...node.data, config: { ...node.data.config, sshTarget } } }
         : node
     )));
+  }
+
+  function updateSelectedNodeExecutionSetting(key: string, value: string | undefined) {
+    if (!selectedNode) return;
+    setNodes((currentNodes) => currentNodes.map((node) => {
+      if (node.id !== selectedNode.id) return node;
+      const config = { ...node.data.config };
+      if (value === undefined) {
+        delete config[key];
+      } else {
+        config[key] = value;
+      }
+      return { ...node, data: { ...node.data, config } };
+    }));
   }
 
   async function createFlow(event: FormEvent<HTMLFormElement>) {
@@ -711,9 +727,37 @@ export function App() {
                         ? <>Resolved command: <code>ssh {selectedNode.data.config.sshTarget}</code></>
                         : <>Example: <code>ssh codex-kali</code>. The host alias must also be approved in the execution environment.</>}
                     </p>
+                    {selectedNode.data.kind !== "approval-gate" && (
+                      <section className="execution-profile">
+                        <div className="execution-profile-heading"><span>AI EXECUTION PROFILE</span><b>ISOLATED PER NODE</b></div>
+                        <label htmlFor="node-model">Codex model</label>
+                        <select
+                          id="node-model"
+                          onChange={(event) => updateSelectedNodeExecutionSetting("model", event.target.value === "session-default" ? undefined : event.target.value)}
+                          value={typeof selectedNode.data.config.model === "string" ? selectedNode.data.config.model : "session-default"}
+                        >
+                          <option value="session-default">Session default</option>
+                          <option value="gpt-5.6-sol">GPT-5.6 Sol — complex work</option>
+                          <option value="gpt-5.6-terra">GPT-5.6 Terra — balanced</option>
+                          <option value="gpt-5.6-luna">GPT-5.6 Luna — repeatable tasks</option>
+                        </select>
+                        <label htmlFor="node-reasoning-effort">Reasoning effort</label>
+                        <select
+                          id="node-reasoning-effort"
+                          onChange={(event) => updateSelectedNodeExecutionSetting("reasoningEffort", event.target.value)}
+                          value={typeof selectedNode.data.config.reasoningEffort === "string" ? selectedNode.data.config.reasoningEffort : "medium"}
+                        >
+                          <option value="low">Low — fastest</option>
+                          <option value="medium">Medium — recommended</option>
+                          <option value="high">High — deeper analysis</option>
+                          <option value="xhigh">Extra high — hardest tasks</option>
+                        </select>
+                        <p className="field-help">Passed to the Codex app-server as per-turn <code>model</code> and <code>effort</code> overrides.</p>
+                      </section>
+                    )}
                     <div className="config-summary"><span><small>Status</small><strong>{statusByNode.get(selectedNode.id) ?? "Not started"}</strong></span><span><small>Messages</small><strong>{selectedNodeMessages.length}</strong></span><span><small>AI calls</small><strong>{selectedNodeInvocations.length}</strong></span></div>
                     <InspectionList label="Agent Messages" values={selectedNodeMessages.map((message) => `${message.trigger}: ${JSON.stringify(message.message)}`)} />
-                    <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
+                    <InspectionList label="AI node activity" values={selectedNodeInvocations.map((invocation) => `${invocation.model ?? "session-default"} · ${invocation.reasoningEffort} · ${invocation.status}: ${JSON.stringify(invocation.output)}`)} />
                     <button className="delete-item-button" onClick={deleteSelectedItem} type="button">Delete node and connections</button>
                   </div>
                 ) : selectedEdge ? (
