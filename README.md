@@ -40,15 +40,15 @@ The remote `assessment-runner` account must be restricted by the VM configuratio
 
 ## Configure a CTF challenge from the UI
 
-Open `/ctf-setup` to configure the Instance target, VM Workspace, Kali or Debian
-SSH alias, Scope Window, resource limits, exploitation permission, Human
-Approval Bypass, model, and reasoning effort. Submitting the form persists and
-audits the SSH environment, creates the isolated VM Workspace through SSH,
-creates the Scope, and creates a versioned Crystal Flow with the corresponding
-policy and approval structure.
+Open `/ctf-setup` to configure the Instance target, relative Challenge File
+Path, VM Workspace, Kali or Debian SSH alias, Scope Window, resource limits,
+exploitation permission, Human Approval Bypass, model, and reasoning effort.
+Submitting the form persists and audits the SSH environment, creates the
+isolated VM Workspace through SSH, adds both the Instance and file path to the
+Scope, and creates a versioned Crystal Flow with a File Analysis Node.
 
 Challenge files are intentionally not uploaded by this page. Copy them to the
-declared VM Workspace separately and keep large or raw files VM-resident.
+declared VM Workspace path separately and keep large or raw files VM-resident.
 
 ## Configure the Codex CLI Session Adapter
 

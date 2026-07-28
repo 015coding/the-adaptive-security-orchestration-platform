@@ -182,9 +182,22 @@ function localDateTimeValue(date: Date): string {
   return local.toISOString().slice(0, 16);
 }
 
+function isSafeRelativeChallengePath(value: string): boolean {
+  const path = value.trim();
+  return Boolean(
+    path
+    && !path.startsWith("/")
+    && !path.startsWith("\\")
+    && !path.includes("\\")
+    && !path.split("/").includes("..")
+    && !path.split("/").includes("")
+  );
+}
+
 function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void }) {
   const [challengeName, setChallengeName] = useState("CTF assessment");
   const [target, setTarget] = useState("");
+  const [challengeFilePath, setChallengeFilePath] = useState("input/challenge.zip");
   const [workspace, setWorkspace] = useState("/srv/crystal-flow/ctf-01");
   const [environment, setEnvironment] = useState<"kali" | "debian">("kali");
   const [sshTarget, setSshTarget] = useState("codex-kali");
@@ -231,6 +244,10 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
       setFormError("Exploitation can only be enabled for an authorized lab environment.");
       return;
     }
+    if (!isSafeRelativeChallengePath(challengeFilePath)) {
+      setFormError("Challenge file path must be relative to the Workspace and cannot contain '..' or start with '/'.");
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -244,13 +261,13 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workspace }),
       });
-      const allowedActions = ["reconnaissance", "verification"];
+      const allowedActions = ["file-analysis", "reconnaissance", "verification"];
       if (includeExploitation) allowedActions.push("exploitation-attempt");
       const scope = await request<ScopeResponse>("/api/scopes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          targets: [target],
+          targets: [target, challengeFilePath],
           workspace,
           allowedActions,
           resourceLimits: { maxRequestsPerSecond, maxConcurrentTasks, maxRuntimeSeconds },
@@ -269,10 +286,20 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
       const reconTarget = approvalRequired ? "ctf-approval" : "ctf-verification";
       const nodes: CrystalFlow["nodes"] = [
         {
+          id: "ctf-file-analysis",
+          type: "verification-step",
+          label: "Challenge File Analysis",
+          position: { x: 40, y: 120 },
+          config: {
+            scopeId: scope.id, target: challengeFilePath, workspace, environment, sshTarget, model, reasoningEffort,
+            action: "file-analysis", branches: { completed: "ctf-recon" },
+          },
+        },
+        {
           id: "ctf-recon",
           type: "recon-agent",
           label: "CTF Recon Agent",
-          position: { x: 80, y: 120 },
+          position: { x: 300, y: 120 },
           config: {
             scopeId: scope.id, target, workspace, environment, sshTarget, model, reasoningEffort,
             action: "reconnaissance", branches: { completed: reconTarget },
@@ -282,7 +309,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
           id: "ctf-verification",
           type: "verification-step",
           label: includeExploitation ? "Exploit & Verify" : "CTF Verification",
-          position: { x: approvalRequired ? 600 : 360, y: 120 },
+          position: { x: approvalRequired ? 720 : 540, y: 120 },
           config: {
             scopeId: scope.id, target, workspace, environment, sshTarget, model, reasoningEffort,
             action: includeExploitation ? "exploitation-attempt" : "verification",
@@ -290,12 +317,13 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
         },
       ];
       const edges: CrystalFlow["edges"] = [];
+      edges.push({ id: "ctf-file-recon", source: "ctf-file-analysis", target: "ctf-recon" });
       if (approvalRequired) {
         nodes.splice(1, 0, {
           id: "ctf-approval",
           type: "approval-gate",
           label: "Owner Approval",
-          position: { x: 340, y: 120 },
+          position: { x: 500, y: 120 },
           config: { scopeId: scope.id, branches: { approved: "ctf-verification" } },
         });
         edges.push(
@@ -323,7 +351,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
       <div className="page-intro">
         <span>AUTHORIZED LAB CONFIGURATION</span>
         <h2>CTF Challenge Setup</h2>
-        <p>Configure the Instance, isolated VM, Scope, runtime limits, approvals, and AI profile. Challenge files remain outside this form and can be copied into the declared VM Workspace separately.</p>
+        <p>Configure the Instance, challenge file path, isolated VM, Scope, runtime limits, approvals, and AI profile. The file itself is still copied into the declared Workspace separately.</p>
       </div>
       <form className="ctf-form" onSubmit={createCtfWorkspace}>
         <section className="page-card">
@@ -331,6 +359,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
           <div className="form-grid">
             <label><span>Challenge name</span><input required value={challengeName} onChange={(event) => setChallengeName(event.target.value)} /></label>
             <label><span>Instance target</span><input placeholder="http://10.10.10.50:8080" required value={target} onChange={(event) => setTarget(event.target.value)} /></label>
+            <label className="wide"><span>Challenge file path inside Workspace</span><input placeholder="input/challenge.zip" required value={challengeFilePath} onChange={(event) => setChallengeFilePath(event.target.value)} /><small className="input-help">Relative path only. Example: <code>input/challenge.zip</code></small></label>
           </div>
         </section>
         <section className="page-card">
@@ -365,7 +394,7 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
           </div>
         </section>
         {formError && <div className="form-error" role="alert">{formError}</div>}
-        <div className="ctf-form-actions"><span>Files are not uploaded by this page.</span><button className="button primary" disabled={submitting} type="submit">{submitting ? "Creating…" : "Create Scope & Crystal Flow"}</button></div>
+        <div className="ctf-form-actions"><span>Copy the file to this path after Workspace creation.</span><button className="button primary" disabled={submitting} type="submit">{submitting ? "Creating…" : "Create Scope & Crystal Flow"}</button></div>
       </form>
     </main>
   );
