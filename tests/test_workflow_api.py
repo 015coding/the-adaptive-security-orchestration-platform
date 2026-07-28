@@ -177,6 +177,100 @@ def test_owner_cannot_save_an_unapproved_workflow_node_type(tmp_path):
     assert saved.status_code == 422
 
 
+def test_owner_can_admit_a_trusted_builtin_and_checksum_approved_external_plugin(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    manifest = {
+        "capabilities": ["api-review"],
+        "permissions": ["network.read"],
+        "inputSchema": {"type": "object"},
+        "outputSchema": {"type": "object"},
+    }
+
+    with TestClient(app) as client:
+        builtin = client.post(
+            "/api/plugins",
+            json={"name": "Built-in API Review", "version": "1.0.0", "builtin": True, "manifest": manifest},
+        )
+        external = client.post(
+            "/api/plugins",
+            json={
+                "name": "External API Review",
+                "version": "1.0.0",
+                "builtin": False,
+                "checksum": "a" * 64,
+                "ownerApproved": True,
+                "manifest": manifest,
+            },
+        )
+        untrusted = client.post(
+            "/api/plugins",
+            json={"name": "Untrusted Plugin", "version": "1.0.0", "builtin": False, "manifest": manifest},
+        )
+        listed = client.get("/api/plugins")
+
+    assert builtin.status_code == 201
+    assert builtin.json()["status"] == "approved"
+    assert builtin.json()["integrityVerified"] is True
+    assert external.status_code == 201
+    assert external.json()["status"] == "approved"
+    assert external.json()["integrityVerified"] is True
+    assert untrusted.status_code == 422
+    assert [plugin["id"] for plugin in listed.json()] == [builtin.json()["id"], external.json()["id"]]
+
+
+def test_owner_can_create_a_governed_custom_agent_and_enable_its_plugin_in_a_crystal_flow(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+    manifest = {
+        "capabilities": ["api-review"],
+        "permissions": ["network.read"],
+        "inputSchema": {"type": "object"},
+        "outputSchema": {"type": "object"},
+    }
+    agent = {
+        "name": "API Specialist",
+        "objective": "Review the permitted API surface.",
+        "instructions": "Use only the declared capability.",
+        "inputs": {"target": "https://lab.example.test"},
+        "capabilities": ["api-review"],
+        "permissions": ["network.read"],
+        "executionLimits": {"maxAttempts": 2, "maxRuntimeSeconds": 60},
+    }
+
+    with TestClient(app) as client:
+        plugin = client.post(
+            "/api/plugins",
+            json={"name": "Built-in API Review", "version": "1.0.0", "builtin": True, "manifest": manifest},
+        ).json()
+        custom_agent = client.post("/api/custom-agents", json={**agent, "pluginId": plugin["id"]})
+        code_attempt = client.post("/api/custom-agents", json={**agent, "pluginId": plugin["id"], "code": "print(1)"})
+        flow = client.post("/api/crystal-flows", json={"name": "Custom API review"}).json()
+        unenabled = client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [{"id": "agent", "type": "custom-agent", "label": "API Specialist", "position": {"x": 0, "y": 0}, "config": {"customAgentId": custom_agent.json()["id"]}}],
+                "edges": [],
+            },
+        )
+        enabled = client.post(f"/api/crystal-flows/{flow['id']}/plugins", json={"pluginId": plugin["id"]})
+        enabled_plugins = client.get(f"/api/crystal-flows/{flow['id']}/plugins")
+        saved = client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [{"id": "agent", "type": "custom-agent", "label": "API Specialist", "position": {"x": 0, "y": 0}, "config": {"customAgentId": custom_agent.json()["id"]}}],
+                "edges": [],
+            },
+        )
+
+    assert custom_agent.status_code == 201
+    assert code_attempt.status_code == 422
+    assert unenabled.status_code == 422
+    assert enabled.status_code == 200
+    assert enabled.json()["version"] == 2
+    assert [item["id"] for item in enabled_plugins.json()] == [plugin["id"]]
+    assert saved.status_code == 200
+    assert saved.json()["version"] == 3
+
+
 def test_permitted_vm_task_runs_in_the_scope_workspace_and_returns_a_host_log_bundle(tmp_path):
     runner = ControlledVmRunner()
     app = create_app(database_path=tmp_path / "platform.db", vm_runner=runner)

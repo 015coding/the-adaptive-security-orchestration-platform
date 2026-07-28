@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.policy import PolicyEngine, PolicyOutcome, ScopePolicyInput
 from app.session_adapter import (
@@ -180,6 +180,73 @@ class ActionResumeResponse(BaseModel):
     reason: str
 
 
+class PluginManifestRequest(BaseModel):
+    capabilities: list[str] = Field(min_length=1)
+    permissions: list[str] = Field(min_length=1)
+    inputSchema: dict[str, object]
+    outputSchema: dict[str, object]
+
+
+class CreatePluginRequest(BaseModel):
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    builtin: bool
+    checksum: str | None = Field(default=None, pattern="^[A-Fa-f0-9]{64}$")
+    ownerApproved: bool = False
+    manifest: PluginManifestRequest
+
+    @model_validator(mode="after")
+    def external_plugins_require_mvp_trust_checks(self) -> "CreatePluginRequest":
+        if not self.builtin and (self.checksum is None or not self.ownerApproved):
+            raise ValueError("External Plugins require an approved checksum and Owner approval")
+        return self
+
+
+class PluginResponse(BaseModel):
+    id: str
+    name: str
+    version: str
+    builtin: bool
+    checksum: str | None
+    status: str
+    integrityVerified: bool
+    manifest: PluginManifestRequest
+
+
+class ExecutionLimitsRequest(BaseModel):
+    maxAttempts: int = Field(ge=1)
+    maxRuntimeSeconds: int = Field(ge=1)
+
+
+class CreateCustomAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    instructions: str = Field(min_length=1)
+    inputs: dict[str, object]
+    capabilities: list[str] = Field(min_length=1)
+    permissions: list[str] = Field(min_length=1)
+    executionLimits: ExecutionLimitsRequest
+    pluginId: str
+
+
+class CustomAgentResponse(BaseModel):
+    id: str
+    name: str
+    objective: str
+    instructions: str
+    inputs: dict[str, object]
+    capabilities: list[str]
+    permissions: list[str]
+    executionLimits: ExecutionLimitsRequest
+    pluginId: str
+
+
+class EnablePluginRequest(BaseModel):
+    pluginId: str
+
+
 class CreateVmTaskRequest(BaseModel):
     scopeId: str
     environment: str = Field(pattern="^(kali|debian)$")
@@ -330,6 +397,36 @@ def _initialize_database(database_path: Path) -> None:
                 reason TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS plugins (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                builtin INTEGER NOT NULL,
+                checksum TEXT,
+                plugin_status TEXT NOT NULL,
+                integrity_verified INTEGER NOT NULL,
+                manifest_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS custom_agents (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                instructions TEXT NOT NULL,
+                inputs_json TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                permissions_json TEXT NOT NULL,
+                execution_limits_json TEXT NOT NULL,
+                plugin_id TEXT NOT NULL REFERENCES plugins(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS crystal_flow_plugins (
+                crystal_flow_id TEXT NOT NULL REFERENCES crystal_flows(id),
+                version INTEGER NOT NULL,
+                plugin_id TEXT NOT NULL REFERENCES plugins(id),
+                PRIMARY KEY (crystal_flow_id, version, plugin_id)
+            );
+
             CREATE TABLE IF NOT EXISTS run_log_bundles (
                 id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL REFERENCES scopes(id),
@@ -414,6 +511,40 @@ def create_app(
             nodes=json.loads(flow["nodes_json"]),
             edges=json.loads(flow["edges_json"]),
         )
+
+    def plugin_response(plugin: sqlite3.Row) -> PluginResponse:
+        return PluginResponse(
+            id=plugin["id"],
+            name=plugin["name"],
+            version=plugin["version"],
+            builtin=bool(plugin["builtin"]),
+            checksum=plugin["checksum"],
+            status=plugin["plugin_status"],
+            integrityVerified=bool(plugin["integrity_verified"]),
+            manifest=PluginManifestRequest.model_validate(json.loads(plugin["manifest_json"])),
+        )
+
+    def custom_agent_response(agent: sqlite3.Row) -> CustomAgentResponse:
+        return CustomAgentResponse(
+            id=agent["id"],
+            name=agent["name"],
+            objective=agent["objective"],
+            instructions=agent["instructions"],
+            inputs=json.loads(agent["inputs_json"]),
+            capabilities=json.loads(agent["capabilities_json"]),
+            permissions=json.loads(agent["permissions_json"]),
+            executionLimits=ExecutionLimitsRequest.model_validate(json.loads(agent["execution_limits_json"])),
+            pluginId=agent["plugin_id"],
+        )
+
+    def flow_plugin_ids(connection: sqlite3.Connection, crystal_flow_id: str, version: int) -> set[str]:
+        return {
+            row["plugin_id"]
+            for row in connection.execute(
+                "SELECT plugin_id FROM crystal_flow_plugins WHERE crystal_flow_id = ? AND version = ?",
+                (crystal_flow_id, version),
+            ).fetchall()
+        }
 
     def scope_policy_input(scope: sqlite3.Row) -> ScopePolicyInput:
         return ScopePolicyInput(
@@ -509,6 +640,142 @@ def create_app(
             edges=[],
         )
 
+    @app.post("/api/plugins", response_model=PluginResponse, status_code=status.HTTP_201_CREATED)
+    def admit_plugin(request: CreatePluginRequest) -> PluginResponse:
+        plugin_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO plugins (
+                    id, name, version, builtin, checksum, plugin_status, integrity_verified, manifest_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plugin_id,
+                    request.name,
+                    request.version,
+                    request.builtin,
+                    request.checksum,
+                    "approved",
+                    True,
+                    request.manifest.model_dump_json(),
+                ),
+            )
+        return PluginResponse(
+            id=plugin_id,
+            name=request.name,
+            version=request.version,
+            builtin=request.builtin,
+            checksum=request.checksum,
+            status="approved",
+            integrityVerified=True,
+            manifest=request.manifest,
+        )
+
+    @app.get("/api/plugins", response_model=list[PluginResponse])
+    def list_plugins() -> list[PluginResponse]:
+        with _connect(resolved_database_path) as connection:
+            plugins = connection.execute("SELECT * FROM plugins ORDER BY rowid").fetchall()
+        return [plugin_response(plugin) for plugin in plugins]
+
+    @app.post("/api/custom-agents", response_model=CustomAgentResponse, status_code=status.HTTP_201_CREATED)
+    def create_custom_agent(request: CreateCustomAgentRequest) -> CustomAgentResponse:
+        agent_id = uuid4().hex
+        with _connect(resolved_database_path) as connection:
+            plugin = connection.execute("SELECT * FROM plugins WHERE id = ?", (request.pluginId,)).fetchone()
+            if plugin is None or plugin["plugin_status"] != "approved":
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent requires an Approved Plugin")
+            manifest = PluginManifestRequest.model_validate(json.loads(plugin["manifest_json"]))
+            if not set(request.capabilities).issubset(manifest.capabilities):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent capabilities must be declared by its Plugin")
+            if not set(request.permissions).issubset(manifest.permissions):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent permissions must be declared by its Plugin")
+            connection.execute(
+                """
+                INSERT INTO custom_agents (
+                    id, name, objective, instructions, inputs_json, capabilities_json,
+                    permissions_json, execution_limits_json, plugin_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    request.name,
+                    request.objective,
+                    request.instructions,
+                    json.dumps(request.inputs),
+                    json.dumps(request.capabilities),
+                    json.dumps(request.permissions),
+                    request.executionLimits.model_dump_json(),
+                    request.pluginId,
+                ),
+            )
+        return CustomAgentResponse(id=agent_id, **request.model_dump())
+
+    @app.get("/api/custom-agents", response_model=list[CustomAgentResponse])
+    def list_custom_agents() -> list[CustomAgentResponse]:
+        with _connect(resolved_database_path) as connection:
+            agents = connection.execute("SELECT * FROM custom_agents ORDER BY rowid").fetchall()
+        return [custom_agent_response(agent) for agent in agents]
+
+    @app.post("/api/crystal-flows/{crystal_flow_id}/plugins", response_model=CrystalFlowResponse)
+    def enable_plugin_in_crystal_flow(
+        crystal_flow_id: str, request: EnablePluginRequest
+    ) -> CrystalFlowResponse:
+        with _connect(resolved_database_path) as connection:
+            flow = current_crystal_flow(connection, crystal_flow_id)
+            if flow is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
+            plugin = connection.execute("SELECT * FROM plugins WHERE id = ?", (request.pluginId,)).fetchone()
+            if plugin is None or plugin["plugin_status"] != "approved":
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Crystal Flow requires an Approved Plugin")
+            if request.pluginId in flow_plugin_ids(connection, crystal_flow_id, flow.version):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Plugin is already enabled in this Crystal Flow")
+            next_version = flow.version + 1
+            connection.execute(
+                """
+                INSERT INTO crystal_flow_versions (crystal_flow_id, version, nodes_json, edges_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (crystal_flow_id, next_version, json.dumps(flow.nodes), json.dumps(flow.edges)),
+            )
+            connection.execute(
+                """
+                INSERT INTO crystal_flow_plugins (crystal_flow_id, version, plugin_id)
+                SELECT crystal_flow_id, ?, plugin_id
+                FROM crystal_flow_plugins
+                WHERE crystal_flow_id = ? AND version = ?
+                """,
+                (next_version, crystal_flow_id, flow.version),
+            )
+            connection.execute(
+                "INSERT INTO crystal_flow_plugins (crystal_flow_id, version, plugin_id) VALUES (?, ?, ?)",
+                (crystal_flow_id, next_version, request.pluginId),
+            )
+        return CrystalFlowResponse(
+            id=flow.id,
+            name=flow.name,
+            version=next_version,
+            nodes=flow.nodes,
+            edges=flow.edges,
+        )
+
+    @app.get("/api/crystal-flows/{crystal_flow_id}/plugins", response_model=list[PluginResponse])
+    def list_enabled_crystal_flow_plugins(crystal_flow_id: str) -> list[PluginResponse]:
+        with _connect(resolved_database_path) as connection:
+            flow = current_crystal_flow(connection, crystal_flow_id)
+            if flow is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
+            plugins = connection.execute(
+                """
+                SELECT plugin.* FROM plugins AS plugin
+                JOIN crystal_flow_plugins AS enabled_plugin ON enabled_plugin.plugin_id = plugin.id
+                WHERE enabled_plugin.crystal_flow_id = ? AND enabled_plugin.version = ?
+                ORDER BY plugin.rowid
+                """,
+                (crystal_flow_id, flow.version),
+            ).fetchall()
+        return [plugin_response(plugin) for plugin in plugins]
+
     @app.get("/api/crystal-flows/{crystal_flow_id}", response_model=CrystalFlowResponse)
     def get_crystal_flow(crystal_flow_id: str) -> CrystalFlowResponse:
         with _connect(resolved_database_path) as connection:
@@ -547,6 +814,20 @@ def create_app(
             current_flow = current_crystal_flow(connection, crystal_flow_id)
             if current_flow is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Crystal Flow not found")
+            enabled_plugin_ids = flow_plugin_ids(connection, crystal_flow_id, current_flow.version)
+            for node in request.nodes:
+                if node.type != "custom-agent":
+                    continue
+                custom_agent_id = node.config.get("customAgentId")
+                if not isinstance(custom_agent_id, str) or not custom_agent_id:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent Nodes require a Custom Agent")
+                custom_agent = connection.execute(
+                    "SELECT plugin_id FROM custom_agents WHERE id = ?", (custom_agent_id,)
+                ).fetchone()
+                if custom_agent is None:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent is not approved")
+                if custom_agent["plugin_id"] not in enabled_plugin_ids:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Custom Agent Plugin is not enabled in this Crystal Flow")
             next_version = current_flow.version + 1
             nodes = [node.model_dump() for node in request.nodes]
             edges = [edge.model_dump() for edge in request.edges]
@@ -556,6 +837,15 @@ def create_app(
                 VALUES (?, ?, ?, ?)
                 """,
                 (crystal_flow_id, next_version, json.dumps(nodes), json.dumps(edges)),
+            )
+            connection.execute(
+                """
+                INSERT INTO crystal_flow_plugins (crystal_flow_id, version, plugin_id)
+                SELECT crystal_flow_id, ?, plugin_id
+                FROM crystal_flow_plugins
+                WHERE crystal_flow_id = ? AND version = ?
+                """,
+                (next_version, crystal_flow_id, current_flow.version),
             )
         return CrystalFlowResponse(
             id=current_flow.id,
