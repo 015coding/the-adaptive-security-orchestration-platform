@@ -584,6 +584,9 @@ select:hover, select:focus { border-color: var(--cyan); }
 .node-glyph--approval-gate { border-color: rgba(242, 187, 88, 0.35); color: var(--amber); background: rgba(242, 187, 88, 0.1); }
 .node-glyph--verification-step { border-color: rgba(101, 212, 154, 0.35); color: var(--green); background: rgba(101, 212, 154, 0.1); }
 .node-glyph--custom-agent { border-color: rgba(134, 132, 240, 0.4); color: #a8a6fa; background: rgba(134, 132, 240, 0.1); }
+.node-glyph--start-node { border-color: rgba(80, 178, 245, 0.4); color: #67baf1; background: rgba(80, 178, 245, 0.1); }
+.node-glyph--resolve-worker { border-color: rgba(210, 119, 235, 0.4); color: #d281ec; background: rgba(210, 119, 235, 0.1); }
+.node-glyph--exit-node { border-color: rgba(239, 107, 114, 0.4); color: #ee858b; background: rgba(239, 107, 114, 0.1); }
 
 .catalog-button {
   width: 100%;

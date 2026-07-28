@@ -18,7 +18,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-type NodeKind = "recon-agent" | "verification-step" | "approval-gate" | "custom-agent";
+type NodeKind = "start-node" | "recon-agent" | "verification-step" | "approval-gate" | "custom-agent" | "resolve-worker" | "exit-node";
 
 type WorkflowNodeData = {
   kind: NodeKind;
@@ -111,17 +111,23 @@ type ExecutionEnvironment = {
 };
 
 const palette: Array<{ kind: NodeKind; label: string }> = [
+  { kind: "start-node", label: "Start Node" },
   { kind: "recon-agent", label: "Recon Agent" },
   { kind: "verification-step", label: "Verification Step" },
   { kind: "approval-gate", label: "Approval Gate" },
+  { kind: "resolve-worker", label: "Resolve / Worker" },
   { kind: "custom-agent", label: "Custom Agent" },
+  { kind: "exit-node", label: "Exit Node" },
 ];
 
 const nodeKindLabels: Record<NodeKind, string> = {
+  "start-node": "START",
   "recon-agent": "RECON",
   "verification-step": "VERIFY",
   "approval-gate": "APPROVAL",
   "custom-agent": "AGENT",
+  "resolve-worker": "WORKER",
+  "exit-node": "EXIT",
 };
 
 function SecurityNode({ data, selected }: NodeProps<WorkflowNode>) {
@@ -286,6 +292,13 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
       const reconTarget = approvalRequired ? "ctf-approval" : "ctf-verification";
       const nodes: CrystalFlow["nodes"] = [
         {
+          id: "ctf-start",
+          type: "start-node",
+          label: "Start CTF Run",
+          position: { x: -180, y: 120 },
+          config: { scopeId: scope.id, branches: { started: "ctf-file-analysis" } },
+        },
+        {
           id: "ctf-file-analysis",
           type: "verification-step",
           label: "Challenge File Analysis",
@@ -313,10 +326,19 @@ function CtfSetupPage({ onCreated }: { onCreated: (flow: CrystalFlow) => void })
           config: {
             scopeId: scope.id, target, workspace, environment, sshTarget, model, reasoningEffort,
             action: includeExploitation ? "exploitation-attempt" : "verification",
+            branches: { completed: "ctf-exit" },
           },
+        },
+        {
+          id: "ctf-exit",
+          type: "exit-node",
+          label: "Exit CTF Run",
+          position: { x: 960, y: 120 },
+          config: {},
         },
       ];
       const edges: CrystalFlow["edges"] = [];
+      edges.push({ id: "ctf-start-file", source: "ctf-start", target: "ctf-file-analysis" });
       edges.push({ id: "ctf-file-recon", source: "ctf-file-analysis", target: "ctf-recon" });
       if (approvalRequired) {
         nodes.splice(1, 0, {
@@ -969,7 +991,7 @@ export function App() {
                         ? <>Resolved command: <code>ssh {selectedNode.data.config.sshTarget}</code></>
                         : <>Example: <code>ssh codex-kali</code>. The host alias must also be approved in the execution environment.</>}
                     </p>
-                    {selectedNode.data.kind !== "approval-gate" && (
+                    {!(["approval-gate", "start-node", "exit-node"] as NodeKind[]).includes(selectedNode.data.kind) && (
                       <section className="execution-profile">
                         <div className="execution-profile-heading"><span>AI EXECUTION PROFILE</span><b>ISOLATED PER NODE</b></div>
                         <label htmlFor="node-model">Codex model</label>

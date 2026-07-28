@@ -50,6 +50,10 @@ Scope, and creates a versioned Crystal Flow with a File Analysis Node.
 Challenge files are intentionally not uploaded by this page. Copy them to the
 declared VM Workspace path separately and keep large or raw files VM-resident.
 
+The Workflow Node Library also includes standard `Start Node`, `Resolve / Worker`,
+and `Exit Node` types. New CTF Flows include Start and Exit automatically; the
+Worker type is available for manual drag-and-drop orchestration.
+
 ## Configure the Codex CLI Session Adapter
 
 Set `CODEX_SESSION_COMMAND` to a local bridge client for the one currently running Codex CLI session. The bridge reads one structured JSON request from standard input and returns JSON with `output` and `resourceUnits` fields. The API serializes all AI-node requests through that bridge and records their result, timeout, and resource usage.

@@ -149,6 +149,34 @@ def test_owner_can_save_a_new_immutable_crystal_flow_graph_version(tmp_path):
     assert original.json()["edges"] == []
 
 
+def test_owner_can_use_start_worker_and_exit_nodes(tmp_path):
+    app = create_app(database_path=tmp_path / "platform.db")
+
+    with TestClient(app) as client:
+        flow = client.post("/api/crystal-flows", json={"name": "Standard lifecycle"}).json()
+        saved = client.put(
+            f"/api/crystal-flows/{flow['id']}",
+            json={
+                "nodes": [
+                    {"id": "start", "type": "start-node", "label": "Start", "position": {"x": 0, "y": 0}, "config": {"branches": {"started": "worker"}}},
+                    {"id": "worker", "type": "resolve-worker", "label": "Worker", "position": {"x": 200, "y": 0}, "config": {"branches": {"resolved": "exit"}}},
+                    {"id": "exit", "type": "exit-node", "label": "Exit", "position": {"x": 400, "y": 0}, "config": {}},
+                ],
+                "edges": [
+                    {"id": "start-worker", "source": "start", "target": "worker"},
+                    {"id": "worker-exit", "source": "worker", "target": "exit"},
+                ],
+            },
+        )
+
+        assert saved.status_code == 200
+        assert [node["type"] for node in saved.json()["nodes"]] == [
+            "start-node",
+            "resolve-worker",
+            "exit-node",
+        ]
+
+
 def test_owner_can_delete_a_crystal_flow_and_its_run_records(tmp_path):
     app = create_app(database_path=tmp_path / "platform.db")
 

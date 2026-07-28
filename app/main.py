@@ -23,10 +23,13 @@ from app.session_adapter import (
 from app.vm_runner import SshVmRunner, VmCommandResult, VmRunnerError
 
 APPROVED_WORKFLOW_NODE_TYPES = {
+    "start-node",
     "recon-agent",
     "verification-step",
     "approval-gate",
     "custom-agent",
+    "resolve-worker",
+    "exit-node",
 }
 
 
