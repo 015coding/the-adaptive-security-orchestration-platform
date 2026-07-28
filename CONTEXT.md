@@ -20,6 +20,10 @@ _Avoid_: Implied permission, default access
 A visible unit of an Assessment Workflow representing an agent, tool task, verification step, or Approval gate.
 _Avoid_: Step, box
 
+**Workflow Canvas**:
+The React Flow interface in which the Owner drags enabled Specialist Agents or Custom Agents into a Crystal Flow and connects its Workflow Nodes.
+_Avoid_: Diagram, pipeline editor
+
 **Agent Message**:
 A structured, auditable handoff of task context, evidence, and result data from one Workflow Node to another.
 _Avoid_: Prompt, chat message
